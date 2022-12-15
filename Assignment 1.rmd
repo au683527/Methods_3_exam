@@ -1,0 +1,1174 @@
+---
+title: "Assignment 1 - Language development in autistic and neurotypical children"
+author: "Lukas Laustsen Aggerholm"
+output: html_document
+date: "2022-12-14"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Assignment 1  - Language development in autistic and neurotypical children
+
+## Quick recap
+Autism Spectrum Disorder is often related to language impairment. However, this phenomenon has rarely been empirically traced in detail: i) relying on actual naturalistic language production, ii) over extended periods of time.
+
+We therefore videotaped circa 30 kids with ASD and circa 30 comparison kids (matched by linguistic performance at visit 1) for ca. 30 minutes of naturalistic interactions with a parent. We repeated the data collection 6 times per kid, with 4 months between each visit. We transcribed the data and counted: 
+i) the amount of words that each kid uses in each video. Same for the parent.
+ii) the amount of unique words that each kid uses in each video. Same for the parent.
+iii) the amount of morphemes per utterance (Mean Length of Utterance) displayed by each child in each video. Same for the parent. 
+
+## The structure of the assignment
+
+Produce a written document (separated from the code) answering the following questions:
+
+Q1 - Briefly describe your simulation process, its goals, and what you have learned from the simulation. Add at least a plot showcasing the results of the simulation. Make a special note on sample size considerations: how much data do you think you will need? what else could you do to increase the precision of your estimates?
+
+Q2 - Briefly describe the empirical data and how they compare to what you learned from the simulation (what can you learn from them?). Briefly describe your model(s) and model quality. Report the findings: how does development differ between autistic and neurotypical children (N.B. remember to report both population and individual level findings)? which additional factors should be included in the model? Add at least one plot showcasing your findings.
+
+## Part 1 - Simulating data
+
+Before we even think of analyzing the data, we should make sure we understand the problem, and we plan the analysis. To do so, we need to simulate data and analyze the simulated data (where we know the ground truth).
+
+In particular, let's imagine we have n autistic and n neurotypical children. We are simulating their average utterance length (Mean Length of Utterance or MLU) in terms of words, starting at Visit 1 and all the way to Visit 6.
+In other words, we need to define a few parameters:
+- average MLU for ASD (population mean) at Visit 1 and average individual deviation from that (population standard deviation)
+- average MLU for TD (population mean) at Visit 1 and average individual deviation from that (population standard deviation)
+- average change in MLU by visit for ASD (population mean) and average individual deviation from that (population standard deviation)
+- average change in MLU by visit for TD (population mean) and average individual deviation from that (population standard deviation)
+- an error term. Errors could be due to measurement, sampling, all sorts of noise. 
+
+Note that this makes a few assumptions: population means are exact values; change by visit is linear (the same between visit 1 and 2 as between visit 5 and 6). This is fine for the exercise. In real life research, you might want to vary the parameter values much more, relax those assumptions and assess how these things impact your inference.
+
+
+We go through the literature and we settle for some values for these parameters:
+- average MLU for ASD and TD: 1.5 (remember the populations are matched for linguistic ability at first visit)
+- average individual variability in initial MLU for ASD 0.5; for TD 0.3 (remember ASD tends to be more heterogeneous)
+- average change in MLU for ASD: 0.4; for TD 0.6 (ASD is supposed to develop less)
+- average individual variability in change for ASD 0.4; for TD 0.2 (remember ASD tends to be more heterogeneous)
+- error is identified as 0.2
+
+
+This would mean that on average the difference between ASD and TD participants is 0 at visit 1, 0.2 at visit 2, 0.4 at visit 3, 0.6 at visit 4, 0.8 at visit 5 and 1 at visit 6.
+
+With these values in mind, simulate data, plot the data (to check everything is alright); and set up an analysis pipeline.
+Remember the usual bayesian workflow:
+- define the formula
+- define the prior
+- prior predictive checks
+- fit the model
+- model quality checks: traceplots, divergences, rhat, effective samples
+- model quality checks: posterior predictive checks, prior-posterior update checks
+
+Once the pipeline is in place, loop through different sample sizes to assess how much data you would need to collect. N.B. for inspiration on how to set this up, check the tutorials by Kurz that are linked in the syllabus.
+
+```{r}
+pacman::p_load(tidyverse, data.table, dplyr, tidybayes, ggplot2, ggridges, plyr, brms, cowplot, cmdstanr, purrr, gridExtra)
+```
+
+
+
+*Setting parameters for the simulation*
+```{r}
+n <- 30
+visit <- 6
+error <- 0.2
+
+mean_MLU_asd <- log(1.5) 
+asd_sigma <- log(1.5) - log(1.5 - 0.5)    
+mean_visit_asd <- 0.12                        
+sigma_visit_asd <- 0.1                      
+mean_MLU_td <- log(1.5)
+td_sigma <- log(1.5) - log(1.5 - 0.3)     
+mean_visit_td <- 0.2                       
+sigma_visit_td <- 0.06
+
+```
+
+
+*Simulating data from parameters*
+```{r}
+set.seed(121)
+
+d1 <- tibble(
+  ID = c(1:n),
+  Intercept = rnorm(n, mean_MLU_asd, asd_sigma),
+  Slope = rnorm(n, mean_visit_asd, sigma_visit_asd),
+  Diagnosis = "ASD"
+)
+
+d1_v <- tibble(
+  expand.grid(
+    ID = c(1:n), 
+    Visit = seq(6))
+)
+  
+
+d1 <- merge(d1, d1_v)
+
+d2 <- tibble(
+  ID = c(n+1:n),
+  Intercept = rnorm(n, mean_MLU_td, td_sigma),
+  Slope = rnorm(n, mean_visit_td, sigma_visit_td),
+  Diagnosis = "TD"
+)
+
+d2_v <- tibble(
+  expand.grid(
+    ID = c(n+1:n), 
+    Visit = seq(6))
+)
+  
+d2 <- merge(d2, d2_v)
+
+df <- rbind(d1, d2)
+
+for (i in seq(nrow(df))) {
+  df$MLU[i] <- exp(rnorm(1, df$Intercept[i] + df$Slope[i] * (df$Visit[i] - 1), 0.2))
+}
+
+simulated_data <- ggplot(df, aes(Visit, MLU, color = Diagnosis, group = ID)) + 
+  theme_bw() + 
+  geom_point() + 
+  geom_line(alpha = 0.3) + ggtitle("Simulated data")
+simulated_data
+```
+
+
+*Building model and setting priors*
+```{r}
+
+model_f <- bf(MLU ~ 0 + Diagnosis + Diagnosis:Visit + (1 + Visit | ID))
+
+get_prior(model_f, data = df, family = lognormal)
+
+MLU_priors <- c(
+  prior(normal(0.41, 0.4), class = b, coef = "DiagnosisASD"),
+  prior(normal(0.41, 0.4), class = b, coef = "DiagnosisTD"),  
+  prior(normal(0,0.2),class=b,coef="DiagnosisASD:Visit"), 
+  prior(normal(0,0.2),class=b,coef="DiagnosisTD:Visit"),
+  prior(normal(0, 0.3), class = sd, coef = Intercept, group = ID), 
+  prior(normal(0, 0.1), class = sd, coef = Visit, group= ID), 
+  prior(normal(0, 0.2), class = sigma),
+  prior(lkj(2), class = cor)
+)
+
+```
+
+
+
+*Prior predictive check*
+```{r, refresh=0}
+MLU_mod_prior <- brm( 
+  model_f, 
+  data = df, 
+  family = lognormal,
+  prior = MLU_priors, 
+  sample_prior = "only", 
+  backend = "cmdstanr",
+  chains = 2, 
+  core = 2, 
+  control = list(adapt_delt = 0.99, max_treedepth = 20))
+
+set.seed(5)
+
+pp <- pp_check(MLU_mod_prior, ndraws=100) + labs(title = "Prior predictive check") + xlim(0, 50)
+pp
+
+```
+
+
+*Posterior predictive check*
+```{r, refresh=0}
+
+MLU_model <- brm( 
+  model_f, 
+  data = df, 
+  family = lognormal,
+  prior = MLU_priors, 
+  sample_prior = T, 
+  backend = "cmdstanr",
+  chains = 2, 
+  core = 2, 
+  control = list(adapt_delt = 0.99, max_treedepth = 20))
+
+set.seed(7)
+pp1 <- pp_check(MLU_model, ndraws=100) + labs(title = "Posterior-predictive check")
+pp1
+grid.arrange(pp, pp1)
+```
+
+
+*Plots*
+```{r}
+plot(MLU_model) 
+
+
+plot(conditional_effects(MLU_model), points = T)
+```
+
+*Prior-posterior update checks*
+```{r, refresh=0}
+#variables(MLU_model) 
+
+posterior <- as_draws_df(MLU_model)
+#-------------------------------------------------------------------------------
+
+plot_intercepts <- ggplot(posterior) +
+  geom_histogram(aes(prior_b_DiagnosisASD),
+                 fill = "black", color = "black", alpha = 0.3, bins = 50) +
+  geom_histogram(aes(b_DiagnosisASD),
+                 fill = "red", color = "red", alpha = 0.3, bins = 50) +
+    geom_histogram(aes(b_DiagnosisTD),
+                 fill = "blue", color = "blue", alpha = 0.3, bins = 50)+
+  xlab("Update check on the intercepts")
+
+#-------------------------------------------------------------------------------
+
+plot_b_visit_ASD <- ggplot(posterior) +
+  geom_histogram(aes(`prior_b_DiagnosisASD:Visit`), fill="black", color="black",alpha=0.6,) +
+  geom_histogram(aes(`b_DiagnosisASD:Visit`), fill="red", color="red",alpha=0.6) + 
+  theme_classic() +
+   xlab("The variability of the slope by visit for ASD")
+
+#-------------------------------------------------------------------------------
+
+plot_b_visit_TD <- ggplot(posterior) +
+  geom_histogram(aes(`prior_b_DiagnosisTD:Visit`), fill="black", color="black",alpha=0.6,) +
+  geom_histogram(aes(`b_DiagnosisTD:Visit`), fill="blue", color="blue",alpha=0.6) +
+  theme_classic() +
+   xlab("The variability of the slope by visit for TD")
+
+#-------------------------------------------------------------------------------
+
+plot_sd_intercept <- ggplot(posterior) +
+  geom_histogram(aes(prior_sd_ID__Intercept),
+                 fill = "black", color = "black", alpha = 0.3, bins = 50) +
+  geom_histogram(aes(sd_ID__Intercept),
+                 fill = "#E68613", color = "#E68613", alpha = 0.3, bins = 50) +
+  theme_bw() +
+  xlab("The variability of the intercept")
+
+#-------------------------------------------------------------------------------
+
+plot_sd_visit <- ggplot(posterior) +
+  geom_histogram(aes(prior_sd_ID__Visit), fill="black", color="black",alpha=0.6,) +
+  geom_histogram(aes(sd_ID__Visit), fill="#E68613", color="#E68613",alpha=0.6) + 
+  theme_classic() +
+   xlab("The variability of the slope")
+
+#-------------------------------------------------------------------------------
+
+#Prior-posterior update checks:
+grid.arrange(plot_intercepts, plot_b_visit_ASD, plot_b_visit_TD, plot_sd_intercept, plot_sd_visit)
+
+```
+
+
+*Estimates of the model*
+```{r}
+summary(MLU_model)
+```
+
+
+*Creating individual estimates from model for each child* 
+```{r}
+temp_re <- ranef(MLU_model)$ID
+for (i in unique(df$ID)) {
+  temp <- as.character(i)
+  df$EstimatedIntercept[df$ID == i] <- temp_re[,,"Intercept"][temp,1]
+  df$EstimatedIntercept_low[df$ID == i] <- temp_re[,,"Intercept"][temp,3]
+  df$EstimatedIntercept_high[df$ID == i] <- temp_re[,,"Intercept"][temp,4]
+  df$EstimatedSlope[df$ID == i] <- temp_re[,,"Visit"][temp,1]
+  df$EstimatedSlope_low[df$ID == i] <- temp_re[,,"Visit"][temp,3]
+  df$EstimatedSlope_high[df$ID == i] <- temp_re[,,"Visit"][temp,4]
+}
+
+df_est1 <- df %>% subset(Visit==1) %>% 
+  mutate(
+    EstimatedIntercept = ifelse(Diagnosis =="ASD",
+                                EstimatedIntercept + 0.34, 
+                                EstimatedIntercept + 0.21),
+    EstimatedIntercept_low = ifelse(Diagnosis=="ASD",
+                                EstimatedIntercept_low + 0.34,
+                                EstimatedIntercept_low + 0.21),
+    EstimatedIntercept_high = ifelse(Diagnosis=="ASD",
+                                EstimatedIntercept_high + 0.34,
+                                EstimatedIntercept_high + 0.21),
+    
+    
+    EstimatedSlope = ifelse(Diagnosis=="ASD",
+                                EstimatedSlope + 0.09, 
+                                EstimatedSlope + 0.19),
+    EstimatedSlope_low = ifelse(Diagnosis=="ASD",
+                                EstimatedSlope_low + 0.09,
+                                EstimatedSlope_low + 0.19),
+    EstimatedSlope_high = ifelse(Diagnosis=="ASD",
+                                EstimatedSlope_high + 0.09,
+                                EstimatedSlope_high + 0.19)
+    
+  )
+```
+
+
+*Comparison between simulated data and individual estimates from model*
+```{r}
+Est_intercept <- ggplot(df_est1)+
+  geom_pointrange(aes(x=as.numeric(as.factor(ID)),y=EstimatedIntercept,
+                      ymin=EstimatedIntercept_low,ymax=EstimatedIntercept_high,
+                      color = Diagnosis),alpha=0.3) +
+  geom_point(aes(x=as.numeric(as.factor(ID)),y=Intercept))+
+  xlab("Child ID")+
+  ylab("Estimated intercept")
+
+
+Est_slope <- ggplot(df_est1)+
+  geom_pointrange(aes(x=as.numeric(as.factor(ID)),y=EstimatedSlope,
+                      ymin=EstimatedSlope_low,ymax=EstimatedSlope_high,
+                      color = Diagnosis),alpha=0.3) +
+  geom_point(aes(x=as.numeric(as.factor(ID)),y=Slope))+
+  xlab("Child ID")+
+  ylab("Estimated slope")
+grid.arrange(Est_intercept, Est_slope)
+```
+
+*Defining function for simulating data for power analysis*
+```{r, refresh=0}
+sim_d <- function(seed, n) {
+  visit <- 6
+  mean_MLU_asd <- log(1.5) 
+  asd_sigma <- log(1.5) - log(1.5 - 0.5)        
+  mean_visit_asd <- 0.12                        
+  sigma_visit_asd <- 0.1                        
+  mean_MLU_td <- log(1.5)
+  td_sigma <- log(1.5) - log(1.5 - 0.3)         
+  mean_visit_td <- 0.2                      
+  sigma_visit_td <- 0.06
+  set.seed(seed)
+ 
+  s_df <- tibble(expand.grid(ID=seq(n),
+                             Diagnosis= c("ASD", "TD"),
+                             Visit = seq(visit))) %>%  
+    mutate(ID = ifelse(Diagnosis == "TD", ID + n, ID), 
+           Intercept = NA, 
+           Slope = NA, 
+           MLU = NA)
+  
+  for (i in seq(s_df$ID)) {
+    s_df$Intercept[s_df$ID == i & s_df$Diagnosis == "ASD"] <- rnorm(1, mean_MLU_asd, asd_sigma)
+    s_df$Intercept[s_df$ID == i & s_df$Diagnosis == "TD"] <- rnorm(1, mean_MLU_td, td_sigma)
+    
+    s_df$Slope[s_df$ID == i & s_df$Diagnosis == "ASD"] <- rnorm(1, mean_visit_asd, sigma_visit_asd)
+    s_df$Slope[s_df$ID == i & s_df$Diagnosis == "TD"] <- rnorm(1, mean_visit_td, sigma_visit_td)
+  }
+  
+  for (i in seq(nrow(s_df))){
+  s_df$MLU[i] <- exp(rnorm(1, (s_df$Intercept[i] + s_df$Slope[i] * (s_df$Visit[i]-1)), 0.2))
+  }
+  return(s_df)
+}
+
+```
+
+
+
+*Power analysis for n = 30.*
+```{r, refresh=0}
+sim_n <- 10  
+
+s_df_n30 <-
+  tibble(seed = 1:sim_n) %>% 
+  mutate(data = map(seed, sim_d, n = 30))
+
+estimates_df_n30 <- tibble(     
+  Model = seq(10),
+  Mean_diff_b = NA,
+  Upper = NA,
+  Lower = NA
+)
+
+#Model_1_n30
+m1_n30 <- update(MLU_model, newdata = s_df_n30$data[1])   
+m1_n30_draws <- as_draws_df(m1_n30)                       
+
+m1_n30_diff <- m1_n30_draws$`b_DiagnosisTD:Visit` - m1_n30_draws$`b_DiagnosisASD:Visit`
+estimates_df_n30[1,2] <- mean(m1_n30_diff)
+estimates_df_n30[1,3] <- quantile(m1_n30_diff, 0.975)
+estimates_df_n30[1,4] <- quantile(m1_n30_diff, 0.025)
+
+#Model_2_n30
+m2_n30 <- update(MLU_model, newdata = s_df_n30$data[2])   
+m2_n30_draws <- as_draws_df(m2_n30)                       
+
+m2_n30_diff <- m2_n30_draws$`b_DiagnosisTD:Visit` - m2_n30_draws$`b_DiagnosisASD:Visit`
+estimates_df_n30[2,2] <- mean(m2_n30_diff)
+estimates_df_n30[2,3] <- quantile(m2_n30_diff, 0.975)
+estimates_df_n30[2,4] <- quantile(m2_n30_diff, 0.025)
+
+#Model_3_n30
+m3_n30 <- update(MLU_model, newdata = s_df_n30$data[3])   
+m3_n30_draws <- as_draws_df(m3_n30)                       
+
+m3_n30_diff <- m3_n30_draws$`b_DiagnosisTD:Visit` - m3_n30_draws$`b_DiagnosisASD:Visit`
+estimates_df_n30[3,2] <- mean(m3_n30_diff)
+estimates_df_n30[3,3] <- quantile(m3_n30_diff, 0.975)
+estimates_df_n30[3,4] <- quantile(m3_n30_diff, 0.025)
+
+#Model_4_n30
+m4_n30 <- update(MLU_model, newdata = s_df_n30$data[4])   
+m4_n30_draws <- as_draws_df(m4_n30)                       
+
+m4_n30_diff <- m4_n30_draws$`b_DiagnosisTD:Visit` - m4_n30_draws$`b_DiagnosisASD:Visit`
+estimates_df_n30[4,2] <- mean(m4_n30_diff)
+estimates_df_n30[4,3] <- quantile(m4_n30_diff, 0.975)
+estimates_df_n30[4,4] <- quantile(m4_n30_diff, 0.025)
+
+#Model_5_n30
+m5_n30 <- update(MLU_model, newdata = s_df_n30$data[5])   
+m5_n30_draws <- as_draws_df(m5_n30)                       
+
+m5_n30_diff <- m5_n30_draws$`b_DiagnosisTD:Visit` - m5_n30_draws$`b_DiagnosisASD:Visit`
+estimates_df_n30[5,2] <- mean(m5_n30_diff)
+estimates_df_n30[5,3] <- quantile(m5_n30_diff, 0.975)
+estimates_df_n30[5,4] <- quantile(m5_n30_diff, 0.025)
+
+#Model_6_n30
+m6_n30 <- update(MLU_model, newdata = s_df_n30$data[6])   
+m6_n30_draws <- as_draws_df(m6_n30)                       
+
+m6_n30_diff <- m6_n30_draws$`b_DiagnosisTD:Visit` - m6_n30_draws$`b_DiagnosisASD:Visit`
+estimates_df_n30[6,2] <- mean(m6_n30_diff)
+estimates_df_n30[6,3] <- quantile(m6_n30_diff, 0.975)
+estimates_df_n30[6,4] <- quantile(m6_n30_diff, 0.025)
+
+#Model_7_n30
+m7_n30 <- update(MLU_model, newdata = s_df_n30$data[7])   
+m7_n30_draws <- as_draws_df(m7_n30)                       
+
+m7_n30_diff <- m7_n30_draws$`b_DiagnosisTD:Visit` - m7_n30_draws$`b_DiagnosisASD:Visit`
+estimates_df_n30[7,2] <- mean(m7_n30_diff)
+estimates_df_n30[7,3] <- quantile(m7_n30_diff, 0.975)
+estimates_df_n30[7,4] <- quantile(m7_n30_diff, 0.025)
+
+#Model_8_n30
+m8_n30 <- update(MLU_model, newdata = s_df_n30$data[8])   
+m8_n30_draws <- as_draws_df(m8_n30)                       
+
+m8_n30_diff <- m8_n30_draws$`b_DiagnosisTD:Visit` - m8_n30_draws$`b_DiagnosisASD:Visit`
+estimates_df_n30[8,2] <- mean(m8_n30_diff)
+estimates_df_n30[8,3] <- quantile(m8_n30_diff, 0.975)
+estimates_df_n30[8,4] <- quantile(m8_n30_diff, 0.025)
+
+#Model_9_n30
+m9_n30 <- update(MLU_model, newdata = s_df_n30$data[9])   
+m9_n30_draws <- as_draws_df(m9_n30)                       
+
+m9_n30_diff <- m9_n30_draws$`b_DiagnosisTD:Visit` - m9_n30_draws$`b_DiagnosisASD:Visit`
+estimates_df_n30[9,2] <- mean(m9_n30_diff)
+estimates_df_n30[9,3] <- quantile(m9_n30_diff, 0.975)
+estimates_df_n30[9,4] <- quantile(m9_n30_diff, 0.025)
+
+#Model_10_n30
+m10_n30 <- update(MLU_model, newdata = s_df_n30$data[10])   
+m10_n30_draws <- as_draws_df(m10_n30)                       
+
+m10_n30_diff <- m10_n30_draws$`b_DiagnosisTD:Visit` - m10_n30_draws$`b_DiagnosisASD:Visit`
+estimates_df_n30[10,2] <- mean(m10_n30_diff)
+estimates_df_n30[10,3] <- quantile(m10_n30_diff, 0.975)
+estimates_df_n30[10,4] <- quantile(m10_n30_diff, 0.025)
+
+#Plot of model estimates and true estimate
+
+power_plot_n30 <- estimates_df_n30 %>% 
+  ggplot(aes(x = Model, y = Mean_diff_b, ymin = Lower, ymax = Upper)) +
+  geom_pointrange(fatten = 1/2) +
+  geom_hline(yintercept = 0.08, color = "red") + 
+  labs(x = "Seed",
+       y = "Difference in slope") +
+  ggtitle("N = 30")  + 
+  scale_x_continuous(breaks=seq(0,10,by=1)) +
+  ylim(-0.04, 0.2)
+power_plot_n30
+```
+
+*Power analysis for n = 50.*
+```{r, refresh=0}
+s_df_n50 <-
+  tibble(seed = 1:sim_n) %>% 
+  mutate(data = map(seed, sim_d, n = 50))
+
+estimates_df_n50 <- tibble(     
+  Model = seq(10),
+  Mean_diff_b = NA,
+  Upper = NA,
+  Lower = NA
+)
+
+#Model_1_n50
+m1_n50 <- update(MLU_model, newdata = s_df_n50$data[1])   
+m1_n50_draws <- as_draws_df(m5_n30)                       
+
+m1_n50_diff <- m1_n50_draws$`b_DiagnosisTD:Visit` - m1_n50_draws$`b_DiagnosisASD:Visit`
+estimates_df_n50[1,2] <- mean(m1_n50_diff)
+estimates_df_n50[1,3] <- quantile(m1_n50_diff, 0.975)
+estimates_df_n50[1,4] <- quantile(m1_n50_diff, 0.025)
+
+#Model_2_n50
+m2_n50 <- update(MLU_model, newdata = s_df_n50$data[2])   
+m2_n50_draws <- as_draws_df(m5_n30)                       
+
+m2_n50_diff <- m2_n50_draws$`b_DiagnosisTD:Visit` - m2_n50_draws$`b_DiagnosisASD:Visit`
+estimates_df_n50[2,2] <- mean(m2_n50_diff)
+estimates_df_n50[2,3] <- quantile(m2_n50_diff, 0.975)
+estimates_df_n50[2,4] <- quantile(m2_n50_diff, 0.025)
+
+#Model_3_n50
+m3_n50 <- update(MLU_model, newdata = s_df_n50$data[3])   
+m3_n50_draws <- as_draws_df(m3_n50)                       
+
+m3_n50_diff <- m3_n50_draws$`b_DiagnosisTD:Visit` - m3_n50_draws$`b_DiagnosisASD:Visit`
+estimates_df_n50[3,2] <- mean(m3_n50_diff)
+estimates_df_n50[3,3] <- quantile(m3_n50_diff, 0.975)
+estimates_df_n50[3,4] <- quantile(m3_n50_diff, 0.025)
+
+#Model_4_n50
+m4_n50 <- update(MLU_model, newdata = s_df_n50$data[4])   
+m4_n50_draws <- as_draws_df(m4_n50)                       
+
+m4_n50_diff <- m4_n50_draws$`b_DiagnosisTD:Visit` - m4_n50_draws$`b_DiagnosisASD:Visit`
+estimates_df_n50[4,2] <- mean(m4_n50_diff)
+estimates_df_n50[4,3] <- quantile(m4_n50_diff, 0.975)
+estimates_df_n50[4,4] <- quantile(m4_n50_diff, 0.025)
+
+#Model_5_n50
+m5_n50 <- update(MLU_model, newdata = s_df_n50$data[5])   
+m5_n50_draws <- as_draws_df(m5_n50)                       
+
+m5_n50_diff <- m5_n50_draws$`b_DiagnosisTD:Visit` - m5_n50_draws$`b_DiagnosisASD:Visit`
+estimates_df_n50[5,2] <- mean(m5_n50_diff)
+estimates_df_n50[5,3] <- quantile(m5_n50_diff, 0.975)
+estimates_df_n50[5,4] <- quantile(m5_n50_diff, 0.025)
+
+#Model_6_n50
+m6_n50 <- update(MLU_model, newdata = s_df_n50$data[6])   
+m6_n50_draws <- as_draws_df(m6_n50)                       
+
+m6_n50_diff <- m6_n50_draws$`b_DiagnosisTD:Visit` - m6_n50_draws$`b_DiagnosisASD:Visit`
+estimates_df_n50[6,2] <- mean(m6_n50_diff)
+estimates_df_n50[6,3] <- quantile(m6_n50_diff, 0.975)
+estimates_df_n50[6,4] <- quantile(m6_n50_diff, 0.025)
+
+#Model_7_n50
+m7_n50 <- update(MLU_model, newdata = s_df_n50$data[7])   
+m7_n50_draws <- as_draws_df(m7_n50)                       
+
+m7_n50_diff <- m7_n50_draws$`b_DiagnosisTD:Visit` - m7_n50_draws$`b_DiagnosisASD:Visit`
+estimates_df_n50[7,2] <- mean(m7_n50_diff)
+estimates_df_n50[7,3] <- quantile(m7_n50_diff, 0.975)
+estimates_df_n50[7,4] <- quantile(m7_n50_diff, 0.025)
+
+#Model_8_n50
+m8_n50 <- update(MLU_model, newdata = s_df_n50$data[8])   
+m8_n50_draws <- as_draws_df(m8_n50)                       
+
+m8_n50_diff <- m8_n50_draws$`b_DiagnosisTD:Visit` - m8_n50_draws$`b_DiagnosisASD:Visit`
+estimates_df_n50[8,2] <- mean(m8_n50_diff)
+estimates_df_n50[8,3] <- quantile(m8_n50_diff, 0.975)
+estimates_df_n50[8,4] <- quantile(m8_n50_diff, 0.025)
+
+#Model_9_n50
+m9_n50 <- update(MLU_model, newdata = s_df_n50$data[9])   
+m9_n50_draws <- as_draws_df(m9_n50)                       
+
+m9_n50_diff <- m9_n50_draws$`b_DiagnosisTD:Visit` - m9_n50_draws$`b_DiagnosisASD:Visit`
+estimates_df_n50[9,2] <- mean(m9_n50_diff)
+estimates_df_n50[9,3] <- quantile(m9_n50_diff, 0.975)
+estimates_df_n50[9,4] <- quantile(m9_n50_diff, 0.025)
+
+#Model_10_n50
+m10_n50 <- update(MLU_model, newdata = s_df_n50$data[10])   
+m10_n50_draws <- as_draws_df(m10_n50)                       
+
+m10_n50_diff <- m10_n50_draws$`b_DiagnosisTD:Visit` - m10_n50_draws$`b_DiagnosisASD:Visit`
+estimates_df_n50[10,2] <- mean(m10_n50_diff)
+estimates_df_n50[10,3] <- quantile(m10_n50_diff, 0.975)
+estimates_df_n50[10,4] <- quantile(m10_n50_diff, 0.025)
+
+#Plot of model estimates and true estimate
+
+power_plot_n50 <- estimates_df_n50 %>% 
+  ggplot(aes(x = Model, y = Mean_diff_b, ymin = Lower, ymax = Upper)) +
+  geom_pointrange(fatten = 1/2) +
+  geom_hline(yintercept = 0.08, color = "red") + 
+  labs(x = "Seed",
+       y = "Difference in slope") +
+  ggtitle("N = 50")  + 
+  scale_x_continuous(breaks=seq(0,10,by=1))  +
+  ylim(-0.04, 0.2)
+power_plot_n50
+```
+
+
+*Power analysis for n = 70*
+```{r, refresh=0}
+s_df_n70 <-
+  tibble(seed = 1:sim_n) %>% 
+  mutate(data = map(seed, sim_d, n = 70))
+
+estimates_df_n70 <- tibble(     
+  Model = seq(10),
+  Mean_diff_b = NA,
+  Upper = NA,
+  Lower = NA
+)
+
+#Model_1_n70
+m1_n70 <- update(MLU_model, newdata = s_df_n70$data[1])   
+m1_n70_draws <- as_draws_df(m1_n70)                      
+
+m1_n70_diff <- m1_n70_draws$`b_DiagnosisTD:Visit` - m1_n70_draws$`b_DiagnosisASD:Visit`
+estimates_df_n70[1,2] <- mean(m1_n70_diff)
+estimates_df_n70[1,3] <- quantile(m1_n70_diff, 0.975)
+estimates_df_n70[1,4] <- quantile(m1_n70_diff, 0.025)
+
+#Model_2_n70
+m2_n70 <- update(MLU_model, newdata = s_df_n70$data[2])   
+m2_n70_draws <- as_draws_df(m2_n70)                       
+
+m2_n70_diff <- m2_n70_draws$`b_DiagnosisTD:Visit` - m2_n70_draws$`b_DiagnosisASD:Visit`
+estimates_df_n70[2,2] <- mean(m2_n70_diff)
+estimates_df_n70[2,3] <- quantile(m2_n70_diff, 0.975)
+estimates_df_n70[2,4] <- quantile(m2_n70_diff, 0.025)
+
+#Model_3_n70
+m3_n70 <- update(MLU_model, newdata = s_df_n70$data[3])   
+m3_n70_draws <- as_draws_df(m3_n70)                       
+
+m3_n70_diff <- m3_n70_draws$`b_DiagnosisTD:Visit` - m3_n70_draws$`b_DiagnosisASD:Visit`
+estimates_df_n70[3,2] <- mean(m3_n70_diff)
+estimates_df_n70[3,3] <- quantile(m3_n70_diff, 0.975)
+estimates_df_n70[3,4] <- quantile(m3_n70_diff, 0.025)
+
+#Model_4_n70
+m4_n70 <- update(MLU_model, newdata = s_df_n70$data[4])   
+m4_n70_draws <- as_draws_df(m4_n70)                       
+
+m4_n70_diff <- m4_n70_draws$`b_DiagnosisTD:Visit` - m4_n70_draws$`b_DiagnosisASD:Visit`
+estimates_df_n70[4,2] <- mean(m4_n70_diff)
+estimates_df_n70[4,3] <- quantile(m4_n70_diff, 0.975)
+estimates_df_n70[4,4] <- quantile(m4_n70_diff, 0.025)
+
+#Model_5_n70
+m5_n70 <- update(MLU_model, newdata = s_df_n70$data[5])   
+m5_n70_draws <- as_draws_df(m5_n70)                       
+
+m5_n70_diff <- m5_n70_draws$`b_DiagnosisTD:Visit` - m5_n70_draws$`b_DiagnosisASD:Visit`
+estimates_df_n70[5,2] <- mean(m5_n70_diff)
+estimates_df_n70[5,3] <- quantile(m5_n70_diff, 0.975)
+estimates_df_n70[5,4] <- quantile(m5_n70_diff, 0.025)
+
+#Model_6_n70
+m6_n70 <- update(MLU_model, newdata = s_df_n70$data[6])   
+m6_n70_draws <- as_draws_df(m6_n70)                       
+
+m6_n70_diff <- m6_n70_draws$`b_DiagnosisTD:Visit` - m6_n70_draws$`b_DiagnosisASD:Visit`
+estimates_df_n70[6,2] <- mean(m6_n70_diff)
+estimates_df_n70[6,3] <- quantile(m6_n70_diff, 0.975)
+estimates_df_n70[6,4] <- quantile(m6_n70_diff, 0.025)
+
+#Model_7_n70
+m7_n70 <- update(MLU_model, newdata = s_df_n70$data[7])   
+m7_n70_draws <- as_draws_df(m7_n70)                       
+
+m7_n70_diff <- m7_n70_draws$`b_DiagnosisTD:Visit` - m7_n70_draws$`b_DiagnosisASD:Visit`
+estimates_df_n70[7,2] <- mean(m7_n70_diff)
+estimates_df_n70[7,3] <- quantile(m7_n70_diff, 0.975)
+estimates_df_n70[7,4] <- quantile(m7_n70_diff, 0.025)
+
+#Model_8_n70
+m8_n70 <- update(MLU_model, newdata = s_df_n70$data[8])   
+m8_n70_draws <- as_draws_df(m8_n70)                       
+
+m8_n70_diff <- m8_n70_draws$`b_DiagnosisTD:Visit` - m8_n70_draws$`b_DiagnosisASD:Visit`
+estimates_df_n70[8,2] <- mean(m8_n70_diff)
+estimates_df_n70[8,3] <- quantile(m8_n70_diff, 0.975)
+estimates_df_n70[8,4] <- quantile(m8_n70_diff, 0.025)
+
+#Model_9_n70
+m9_n70 <- update(MLU_model, newdata = s_df_n70$data[9])   
+m9_n70_draws <- as_draws_df(m9_n70)                       
+
+m9_n70_diff <- m9_n70_draws$`b_DiagnosisTD:Visit` - m9_n70_draws$`b_DiagnosisASD:Visit`
+estimates_df_n70[9,2] <- mean(m9_n70_diff)
+estimates_df_n70[9,3] <- quantile(m9_n70_diff, 0.975)
+estimates_df_n70[9,4] <- quantile(m9_n70_diff, 0.025)
+
+#Model_10_n70
+m10_n70 <- update(MLU_model, newdata = s_df_n70$data[10])   
+m10_n70_draws <- as_draws_df(m10_n70)                       
+
+m10_n70_diff <- m10_n70_draws$`b_DiagnosisTD:Visit` - m10_n70_draws$`b_DiagnosisASD:Visit`
+estimates_df_n70[10,2] <- mean(m10_n70_diff)
+estimates_df_n70[10,3] <- quantile(m10_n70_diff, 0.975)
+estimates_df_n70[10,4] <- quantile(m10_n70_diff, 0.025)
+
+#Plot of model estimates and true estimate
+
+power_plot_n70 <- estimates_df_n70 %>% 
+  ggplot(aes(x = Model, y = Mean_diff_b, ymin = Lower, ymax = Upper)) +
+  geom_pointrange(fatten = 1/2) +
+  geom_hline(yintercept = 0.08, color = "red") +
+  labs(x = "Seed",
+       y = "Difference in slope") +
+  ggtitle("N = 70") + 
+  scale_x_continuous(breaks=seq(0,10,by=1))  +
+  ylim(-0.04, 0.2)
+power_plot_n70              
+```
+
+
+*Power analysis for n = 100*
+```{r, refresh=0}
+s_df_n100 <-
+  tibble(seed = 1:sim_n) %>% 
+  mutate(data = map(seed, sim_d, n = 100))
+
+estimates_df_n100 <- tibble(     
+  Model = seq(10),
+  Mean_diff_b = NA,
+  Upper = NA,
+  Lower = NA
+)
+
+#Model_1_n100
+m1_n100 <- update(MLU_model, newdata = s_df_n100$data[1])   
+m1_n100_draws <- as_draws_df(m1_n100)                       
+
+m1_n100_diff <- m1_n100_draws$`b_DiagnosisTD:Visit` - m1_n100_draws$`b_DiagnosisASD:Visit`
+estimates_df_n100[1,2] <- mean(m1_n100_diff)
+estimates_df_n100[1,3] <- quantile(m1_n100_diff, 0.975)
+estimates_df_n100[1,4] <- quantile(m1_n100_diff, 0.025)
+
+#Model_2_n100
+m2_n100 <- update(MLU_model, newdata = s_df_n100$data[2])   
+m2_n100_draws <- as_draws_df(m2_n100)                       
+
+m2_n100_diff <- m2_n100_draws$`b_DiagnosisTD:Visit` - m2_n100_draws$`b_DiagnosisASD:Visit`
+estimates_df_n100[2,2] <- mean(m1_n100_diff)
+estimates_df_n100[2,3] <- quantile(m1_n100_diff, 0.975)
+estimates_df_n100[2,4] <- quantile(m1_n100_diff, 0.025)
+
+#Model_3_n100
+m3_n100 <- update(MLU_model, newdata = s_df_n100$data[3])   
+m3_n100_draws <- as_draws_df(m3_n100)                       
+
+m3_n100_diff <- m3_n100_draws$`b_DiagnosisTD:Visit` - m3_n100_draws$`b_DiagnosisASD:Visit`
+estimates_df_n100[3,2] <- mean(m3_n100_diff)
+estimates_df_n100[3,3] <- quantile(m3_n100_diff, 0.975)
+estimates_df_n100[3,4] <- quantile(m3_n100_diff, 0.025)
+
+#Model_4_n100
+m4_n100 <- update(MLU_model, newdata = s_df_n100$data[4])   
+m4_n100_draws <- as_draws_df(m4_n100)                       
+
+m4_n100_diff <- m4_n100_draws$`b_DiagnosisTD:Visit` - m4_n100_draws$`b_DiagnosisASD:Visit`
+estimates_df_n100[4,2] <- mean(m4_n100_diff)
+estimates_df_n100[4,3] <- quantile(m4_n100_diff, 0.975)
+estimates_df_n100[4,4] <- quantile(m4_n100_diff, 0.025)
+
+#Model_5_n100
+m5_n100 <- update(MLU_model, newdata = s_df_n100$data[5])   
+m5_n100_draws <- as_draws_df(m5_n100)                       
+
+m5_n100_diff <- m5_n100_draws$`b_DiagnosisTD:Visit` - m5_n100_draws$`b_DiagnosisASD:Visit`
+estimates_df_n100[5,2] <- mean(m5_n100_diff)
+estimates_df_n100[5,3] <- quantile(m5_n100_diff, 0.975)
+estimates_df_n100[5,4] <- quantile(m5_n100_diff, 0.025)
+
+#Model_6_n100
+m6_n100 <- update(MLU_model, newdata = s_df_n100$data[6])   
+m6_n100_draws <- as_draws_df(m6_n100)                       
+
+m6_n100_diff <- m6_n100_draws$`b_DiagnosisTD:Visit` - m6_n100_draws$`b_DiagnosisASD:Visit`
+estimates_df_n100[6,2] <- mean(m6_n100_diff)
+estimates_df_n100[6,3] <- quantile(m6_n100_diff, 0.975)
+estimates_df_n100[6,4] <- quantile(m6_n100_diff, 0.025)
+
+#Model_7_n100
+m7_n100 <- update(MLU_model, newdata = s_df_n100$data[7])   
+m7_n100_draws <- as_draws_df(m7_n100)                       
+
+m7_n100_diff <- m7_n100_draws$`b_DiagnosisTD:Visit` - m7_n100_draws$`b_DiagnosisASD:Visit`
+estimates_df_n100[7,2] <- mean(m7_n100_diff)
+estimates_df_n100[7,3] <- quantile(m7_n100_diff, 0.975)
+estimates_df_n100[7,4] <- quantile(m7_n100_diff, 0.025)
+
+#Model_8_n100
+m8_n100 <- update(MLU_model, newdata = s_df_n100$data[8])   
+m8_n100_draws <- as_draws_df(m8_n100)                       
+
+m8_n100_diff <- m8_n100_draws$`b_DiagnosisTD:Visit` - m8_n100_draws$`b_DiagnosisASD:Visit`
+estimates_df_n100[8,2] <- mean(m8_n100_diff)
+estimates_df_n100[8,3] <- quantile(m8_n100_diff, 0.975)
+estimates_df_n100[8,4] <- quantile(m8_n100_diff, 0.025)
+
+#Model_9_n100
+m9_n100 <- update(MLU_model, newdata = s_df_n100$data[9])   
+m9_n100_draws <- as_draws_df(m9_n100)                       
+
+m9_n100_diff <- m9_n100_draws$`b_DiagnosisTD:Visit` - m9_n100_draws$`b_DiagnosisASD:Visit`
+estimates_df_n100[9,2] <- mean(m9_n100_diff)
+estimates_df_n100[9,3] <- quantile(m9_n100_diff, 0.975)
+estimates_df_n100[9,4] <- quantile(m9_n100_diff, 0.025)
+
+#Model_10_n100
+m10_n100 <- update(MLU_model, newdata = s_df_n100$data[10])   
+m10_n100_draws <- as_draws_df(m10_n100)                       
+
+m10_n100_diff <- m10_n100_draws$`b_DiagnosisTD:Visit` - m10_n100_draws$`b_DiagnosisASD:Visit`
+estimates_df_n100[10,2] <- mean(m10_n100_diff)
+estimates_df_n100[10,3] <- quantile(m10_n100_diff, 0.975)
+estimates_df_n100[10,4] <- quantile(m10_n100_diff, 0.025)
+
+#Plot of model estimates and true estimate
+
+power_plot_n100 <- estimates_df_n100 %>% 
+  ggplot(aes(x = Model, y = Mean_diff_b, ymin = Lower, ymax = Upper)) +
+  geom_pointrange(fatten = 1/2) +
+  geom_hline(yintercept = 0.08, color = "red") + 
+  labs(x = "Seed",
+       y = "Difference in slope") +
+  ggtitle("N = 100")  + 
+  scale_x_continuous(breaks=seq(0,10,by=1))  + 
+  ylim(-0.04, 0.2)
+power_plot_n100
+```
+
+
+```{r}
+grid.arrange(power_plot_n30, power_plot_n50, power_plot_n70, power_plot_n100)
+```
+
+
+
+# Part 2 - Strong in the Bayesian ken, you are now ready to analyse the actual data
+
+Q1: Describe your sample (n, age, gender, clinical and cognitive features of the two groups) and critically assess whether the groups (ASD and TD) are balanced. Briefly discuss whether the data is enough given the simulations in part 1.
+Q2: Describe linguistic development (in terms of MLU over time) in TD and ASD children (as a function of group). Discuss the difference (if any) between the two groups.
+Q3: Describe individual differences in linguistic development: do all kids follow the same path? Are all kids reflected by the general trend for their group?
+
+- Include additional predictors in your model of language development (N.B. not other indexes of child language: types and tokens, that'd be cheating). Identify the best model, by conceptual reasoning, model comparison or a mix. Report the model you choose (and name its competitors, if any) and discuss why it's the best model.
+
+```{r, refresh=0}
+data_clean <- read_csv("data_clean.csv")
+
+colnames(data_clean)[1] = "ID" 
+
+data_clean <- data_clean %>%
+  filter(CHI_MLU != 0) 
+```
+
+
+*Describing the data*
+```{r}
+data_clean$ID <- as.factor(data_clean$ID)
+
+length(unique(subset(data_clean, data_clean$Gender == "F")$ID))
+length(unique(subset(data_clean, data_clean$Gender == "M")$ID))
+
+summary(subset(data_clean, data_clean$Visit == 1 & data_clean$Diagnosis == "TD")$Age)
+summary(subset(data_clean, data_clean$Visit == 1 & data_clean$Diagnosis == "ASD")$Age)
+
+length(unique(subset(data_clean, data_clean$Diagnosis== "TD")$ID))
+length(unique(subset(data_clean, data_clean$Diagnosis== "ASD")$ID))
+
+length(unique(subset(data_clean, data_clean$Diagnosis== "ASD" & data_clean$Gender == "F")$ID))
+
+
+```
+
+
+*Comparison between simulated and empirical data*
+```{r}
+real_data <- ggplot(data_clean, aes(Visit, CHI_MLU, color = Diagnosis, group = ID)) + 
+  theme_bw() + 
+  geom_point() + 
+  geom_line(alpha = 0.3) + 
+  ggtitle("Real data")
+grid.arrange(simulated_data, real_data)
+```
+
+*Setting broader priors for our model*
+```{r}
+unWords_f <- bf(CHI_MLU ~ 0 + Diagnosis + Diagnosis:Visit + (1 + Visit|ID))
+
+CHI_MLU_priors <- c(
+  prior(normal(0.41, 0.5), class = b, coef = "DiagnosisASD"), 
+  prior(normal(0.41, 0.5), class = b, coef = "DiagnosisTD"), 
+  prior(normal(0,0.2),class=b,coef="DiagnosisASD:Visit"), 
+  prior(normal(0,0.2),class=b,coef="DiagnosisTD:Visit"),
+  prior(normal(0, 0.5), class = sd, coef = Intercept, group = ID), 
+  prior(normal(0, 0.1), class = sd, coef = Visit, group= ID), 
+  prior(normal(0, 0.2), class = sigma),
+  prior(lkj(2), class = cor) 
+)
+```
+
+*Prior predictive check*
+```{r, refresh=0}
+set.seed(25)
+MLU_f_prior_s <- 
+  brm(
+    unWords_f, 
+    data = data_clean,
+    family = lognormal,
+    prior = CHI_MLU_priors,  
+    sample_prior = "only", 
+    backend = "cmdstanr",
+    cores = 2,
+    chains = 2,
+    control = list(adapt_delta = 0.99, max_treedepth = 20))
+pp_check(MLU_f_prior_s, ndraws = 100) + labs(title = "Prior predictive check") + xlim(0, 100)
+
+```
+
+*Posterior predictive check*
+```{r, refresh=0}
+set.seed(25)
+MLU_f_posterior <- 
+  brm(
+    unWords_f, 
+    data = data_clean,
+    family = lognormal,
+    prior = CHI_MLU_priors,  
+    sample_prior = T, 
+    backend = "cmdstanr",
+    cores = 2,
+    chains = 2,
+    control = list(adapt_delta = 0.99, max_treedepth = 20))
+pp_check(MLU_f_posterior, ndraws = 100) + labs(title = "Posterior predictive check")
+```
+
+
+*Prior-posterior update checks*
+```{r, refresh=0}
+#variables(MLU_f_posterior) 
+
+posterior_real <- as_draws_df(MLU_f_posterior)
+#-------------------------------------------------------------------------------
+
+plot_intercepts_real <- ggplot(posterior_real) +
+  geom_histogram(aes(prior_b_DiagnosisASD),
+                 fill = "black", color = "black", alpha = 0.3, bins = 50) +
+  geom_histogram(aes(b_DiagnosisASD),
+                 fill = "red", color = "red", alpha = 0.3, bins = 50) +
+    geom_histogram(aes(b_DiagnosisTD),
+                 fill = "blue", color = "blue", alpha = 0.3, bins = 50)+
+  xlab("Update check on the intercepts")
+
+#-------------------------------------------------------------------------------
+
+plot_b_visit_ASD_real <- ggplot(posterior_real) +
+  geom_histogram(aes(`prior_b_DiagnosisASD:Visit`), fill="black", color="black",alpha=0.6,) +
+  geom_histogram(aes(`b_DiagnosisASD:Visit`), fill="red", color="red",alpha=0.6) + 
+  theme_classic() +
+   xlab("The variability of the slope by visit for ASD")
+
+#-------------------------------------------------------------------------------
+
+plot_b_visit_TD_real <- ggplot(posterior_real) +
+  geom_histogram(aes(`prior_b_DiagnosisTD:Visit`), fill="black", color="black",alpha=0.6,) +
+  geom_histogram(aes(`b_DiagnosisTD:Visit`), fill="blue", color="blue",alpha=0.6) +
+  theme_classic() +
+   xlab("The variability of the slope by visit for TD")
+
+#-------------------------------------------------------------------------------
+
+plot_sd_intercept_real <- ggplot(posterior_real) +
+  geom_histogram(aes(prior_sd_ID__Intercept),
+                 fill = "black", color = "black", alpha = 0.3, bins = 50) +
+  geom_histogram(aes(sd_ID__Intercept),
+                 fill = "#E68613", color = "#E68613", alpha = 0.3, bins = 50) +
+  theme_bw() +
+  xlab("The variability of the intercept")
+
+#-------------------------------------------------------------------------------
+
+plot_sd_visit_real <- ggplot(posterior_real) +
+  geom_histogram(aes(prior_sd_ID__Visit), fill="black", color="black",alpha=0.6,) +
+  geom_histogram(aes(sd_ID__Visit), fill="#E68613", color="#E68613",alpha=0.6) + 
+  theme_classic() +
+   xlab("The variability of the slope")
+
+#-------------------------------------------------------------------------------
+
+grid.arrange(plot_intercepts_real, plot_b_visit_ASD_real, plot_b_visit_TD_real, plot_sd_intercept_real, plot_sd_visit_real)
+
+```
+
+*Model estimates*
+```{r}
+summary(MLU_f_posterior)
+```
+
+
+*Testing if the difference in estimates for the two groups is significant*
+```{r, refresh=0}
+hypothesis(MLU_f_posterior, "DiagnosisTD:Visit > DiagnosisASD:Visit")
+```
+
+
+*Prior-posterior update check of difference in slope between the two groups*
+```{r, refresh=0}
+samples_asd <- prior_draws(MLU_f_posterior, "b_DiagnosisASD:Visit")
+samples_asd <- as_tibble(samples_asd) 
+
+samples_td <- prior_draws(MLU_f_posterior, "b_DiagnosisTD:Visit")
+samples_td <- tibble(samples_td) 
+
+
+prior_dis_of_diff <- samples_td$`b_DiagnosisTD:Visit` - samples_asd$`b_DiagnosisASD:Visit`
+prior_dis_of_diff <- tibble(Difference = prior_dis_of_diff)
+
+#-------------------------------------------------------------------------------
+
+posterior_real <- as_draws_df(MLU_f_posterior)
+
+
+prior_dis_of_diff_plot <- ggplot() + 
+  geom_histogram(data = prior_dis_of_diff, aes(x = Difference), color = "grey", fill = "grey", alpha = 0.6) +
+  geom_histogram(data = posterior_real, aes(x = `b_DiagnosisTD:Visit` - `b_DiagnosisASD:Visit`), color = "blue", fill = "blue", alpha = 0.6) + 
+  labs(x =  "Prior-posterior update check of difference in slope between the two groups")
+
+prior_dis_of_diff_plot
+
+
+```
+
+*Comparison between empirical data and individual estimates from model*
+```{r, refresh=0}
+temp_re_real <- ranef(MLU_f_posterior)$ID
+for (i in unique(data_clean$ID)) {
+  temp <- as.character(i)
+  data_clean$EstimatedIntercept[data_clean$ID == i] <- temp_re_real[,,"Intercept"][temp,1] 
+  data_clean$EstimatedIntercept_low[data_clean$ID == i] <- temp_re_real[,,"Intercept"][temp,3]
+  data_clean$EstimatedIntercept_high[data_clean$ID == i] <- temp_re_real[,,"Intercept"][temp,4]
+  data_clean$EstimatedSlope[data_clean$ID == i] <- temp_re_real[,,"Visit"][temp,1]
+  data_clean$EstimatedSlope_low[data_clean$ID == i] <- temp_re_real[,,"Visit"][temp,3]
+  data_clean$EstimatedSlope_high[data_clean$ID == i] <- temp_re_real[,,"Visit"][temp,4]
+}
+
+df_est1_real <- data_clean %>% subset(Visit==1) %>% 
+  mutate(
+    EstimatedIntercept = ifelse(Diagnosis =="ASD",
+                                EstimatedIntercept + 0.24, 
+                                EstimatedIntercept + 0.17), 
+    EstimatedIntercept_low = ifelse(Diagnosis=="ASD",
+                                EstimatedIntercept_low + 0.24,
+                                EstimatedIntercept_low + 0.17),
+    EstimatedIntercept_high = ifelse(Diagnosis=="ASD",
+                                EstimatedIntercept_high + 0.24,
+                                EstimatedIntercept_high + 0.17),
+    
+    
+    EstimatedSlope = ifelse(Diagnosis=="ASD",
+                                EstimatedSlope + 0.03, 
+                                EstimatedSlope + 0.17),
+    EstimatedSlope_low = ifelse(Diagnosis=="ASD",
+                                EstimatedSlope_low + 0.03,
+                                EstimatedSlope_low + 0.17),
+    EstimatedSlope_high = ifelse(Diagnosis=="ASD",
+                                EstimatedSlope_high + 0.03,
+                                EstimatedSlope_high + 0.17)
+    
+  )
+#-------------------------------------------------------------------------------
+Chi_MLU_v1 <- data_clean%>%
+  filter(Visit == 1
+         )
+Chi_MLU_values <- Chi_MLU_v1$CHI_MLU
+
+Est_intercept_real <- ggplot(df_est1_real)+
+  geom_pointrange(aes(x=as.numeric(as.factor(ID)),y=EstimatedIntercept,
+                      ymin=EstimatedIntercept_low,ymax=EstimatedIntercept_high,
+                      color = Diagnosis),alpha=0.3) +
+  geom_point(aes(x=as.numeric(as.factor(ID)), y= Chi_MLU_values))+
+  xlab("Child ID")+
+  ylab("Estimated intercept")
+Est_intercept_real
+
+
+#-------------------------------------------------------------------------------
+mlu_v6 <- data_clean%>%
+  filter(Visit == 6)
+Chi_MLU_values_v6 <- mlu_v6$CHI_MLU
+diff_slope_real <- (Chi_MLU_values_v6-Chi_MLU_values)/5
+
+Est_slope_real <- ggplot(df_est1_real)+
+  geom_pointrange(aes(x=as.numeric(as.factor(ID)),y=EstimatedSlope,
+                      ymin=EstimatedSlope_low,ymax=EstimatedSlope_high,
+                      color = Diagnosis),alpha=0.3) +
+  geom_point(aes(x=as.numeric(as.factor(ID)),y = diff_slope_real))+
+  xlab("Child ID")+
+  ylab("Estimated slope")
+
+grid.arrange(Est_intercept_real, Est_slope_real)
+
+
+```
+
+
+
+*Adding MOT_MLU to the model*
+```{r, refresh=0}
+addition_f1 <- bf(CHI_MLU ~ 0 + Diagnosis + Diagnosis:Visit + Diagnosis:MOT_MLU + (1 + Visit|ID))
+get_prior(addition_f1, data_clean, lognormal)
+
+MLU_add_1_p <- c( 
+  prior(normal(0.41, 0.5), class = b, coef = "DiagnosisASD"), 
+  prior(normal(0.41, 0.5), class = b, coef = "DiagnosisTD"),  
+  prior(normal(0,0.2),class=b,coef="DiagnosisASD:Visit"), 
+  prior(normal(0,0.2),class=b,coef="DiagnosisTD:Visit"),
+  prior(normal(0, 0.3), class = b, coef = "DiagnosisASD:MOT_MLU"),
+  prior(normal(0, 0.3), class = b, coef = "DiagnosisTD:MOT_MLU"),
+  prior(normal(0, 0.5), class = sd, coef = Intercept, group = ID), 
+  prior(normal(0, 0.1), class = sd, coef = Visit, group= ID), 
+  prior(normal(0, 0.2), class = sigma),
+  prior(lkj(2), class = cor) 
+)
+
+m_1_add <- 
+  brm(
+    addition_f1, 
+    data = data_clean,
+    family = lognormal,
+    prior = MLU_add_1_p,  
+    sample_prior = T, 
+    backend = "cmdstanr",
+    cores = 2,
+    chains = 2,
+    control = list(adapt_delta = 0.99, max_treedepth = 20))
+update(m_1_add)
+
+
+```
+*Comparing the models*
+```{r, refresh=0}
+m_1_add <- add_criterion(m_1_add, criterion = "loo")
+
+data_clean$looic <- m_1_add$criteria$loo$pointwise[,"looic"]
+ggplot(data_clean, aes(x = ID , y = looic, color = Diagnosis)) + geom_point() + theme_bw()
+
+MLU_f_posterior <- add_criterion(MLU_f_posterior, criterion = "loo")
+data_clean$looic_MLU_post <- MLU_f_posterior$criteria$loo$pointwise[,"looic"]
+ggplot(data_clean, aes(x = ID , y = looic_MLU_post, color = Diagnosis)) + geom_point() + theme_bw()
+
+loo_compare(MLU_f_posterior, m_1_add)
+loo_model_weights(MLU_f_posterior, m_1_add)
+```
+
+
+
+
+

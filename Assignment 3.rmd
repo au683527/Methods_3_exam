@@ -1,0 +1,1180 @@
+---
+title: "Assignment-3"
+author: "Lukas Laustsen Aggerholm"
+date: "2022-12-14"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+# Assignment 3: Machine learning
+
+3 main parts:
+1. Create a skeptical and an informed simulation, based on the meta-analysis.
+2. Build and test our machine learning pipeline on the simulated data.
+3. Apply the pipeline to the empirical data.
+
+Report:
+- Describe your machine learning pipeline. Produce a diagram of it to guide the reader (e.g. see Rybner et al 2022 Vocal markers of autism: Assessing the generalizability of ML models), and describe the different parts: data budgeting, data preprocessing, model choice and training, assessment of performance.
+- Briefly justify and describe your use of simulated data, and results from the pipeline on them.
+- Describe results from applying the ML pipeline to the empirical data and what can we learn from them.
+
+
+```{r}
+pacman::p_load(tidyverse, dplyr, tidybayes, ggplot2, ggridges, plyr, brms, cmdstanr, gridExtra, readxl, tidymodels, knitr, dotwhisker, DALEX, DALEXtra, tidytext, reshape, stringr, groupdata2, rsample)
+```
+
+
+## Part I - Simulating data
+
+Use the meta-analysis reported in Parola et al (2020), create a simulated dataset with 100 matched pairs of schizophrenia and controls, each participant producing 10 repeated measures (10 trials with their speech recorded). for each of these "recordings" (data points) produce 10 acoustic measures: 6 from the meta-analysis, 4 with just random noise. Do the same for a baseline data set including only 10 noise variables. Tip: see the slides for the code. 
+
+
+Taken from Parola et al (2020). 
+
+Values used for the simulation:
+*-0.55* - for pitch variability;
+*-1.26* - proportion of spoken time;
+*-0.75* - speech rate;
+*1.89* - duration of pauses;
+*0.25* - pitch mean;
+*0.05* - number of pauses.
+
+*Defining variables for simulation*
+```{r}
+n <- 100
+trials <- 10
+
+InformedEffectMean <- c(-1.26, -0.55, -0.75, 1.89, 0.25, 0.05, 0, 0, 0, 0) 
+SkepticEffectMean <- rep(0, 10) 
+
+IndividualSD <- 1
+TrialSD <- 0.5
+Error <- 0.2
+```
+
+
+*Simulating data*
+```{r}
+for (i in seq(10)) {
+  temp_informed <- tibble( 
+    ID = seq(n),
+    TrueEffect = rnorm(n, InformedEffectMean[i], IndividualSD),
+    Variable = paste0("v", i))
+  
+  temp_skeptic <- tibble( 
+    ID = seq(n),
+    TrueEffect = rnorm(n, SkepticEffectMean[i], IndividualSD),
+    Variable = paste0("v", i))
+  if (i == 1) {
+    d_informed_true <- temp_informed 
+    d_skeptic_true <- temp_skeptic 
+  } else {
+    d_informed_true <- rbind(d_informed_true, temp_informed )
+    d_skeptic_true <- rbind(d_skeptic_true, temp_skeptic)
+  }
+}
+```
+
+
+*Simulating data*
+```{r}
+d_trial <- tibble(expand_grid(ID = seq(n), Trial = seq(trials), Group = c("Schizophrenia", "Control")))
+
+d_informed <- merge(d_informed_true, d_trial) 
+d_skeptic <- merge(d_skeptic_true, d_trial)
+
+for (i in seq(nrow(d_informed))) { 
+  d_informed$measurement[i] <- ifelse(d_informed$Group[i] == "Schizophrenia", 
+                                      rnorm(1, rnorm(1, d_informed$TrueEffect[i]/2, TrialSD), Error), 
+                                      rnorm(1, rnorm(1, (-d_informed$TrueEffect[i])/2, TrialSD), Error))
+  d_skeptic$measurement[i] <- ifelse(d_skeptic$Group[i] == "Schizophrenia", 
+                                      rnorm(1, rnorm(1, d_skeptic$TrueEffect[i]/2, TrialSD), Error),
+                                      rnorm(1, rnorm(1, (-d_skeptic$TrueEffect[i])/2, TrialSD), Error))
+}
+
+d_informed_wide <- d_informed %>% 
+  mutate(TrueEffect = NULL) %>% 
+  pivot_wider(names_from = Variable, values_from = measurement)
+
+d_skeptic_wide <- d_skeptic %>% 
+  mutate(TrueEffect = NULL) %>% 
+  pivot_wider(names_from = Variable, values_from = measurement)
+
+ggplot(d_informed_wide, aes(x = v4, y = Group, color = Group)) + geom_point() + theme_bw() 
+ggplot(d_skeptic_wide, aes(x = v4, y = Group, color = Group)) + geom_point() + theme_bw()
+```
+
+
+*Comparing distribution of variables between HC and SCZ for skeptic and informed data*
+```{r}
+plot_informed_vars <- ggplot(d_informed, aes(x = measurement, color = Group, fill = Group)) +
+  geom_density(alpha = 0.5) +
+  facet_wrap(~Variable) +
+  ggtitle("Plot of informed data")
+
+plot_skeptic_vars <- ggplot(d_skeptic, aes(x = measurement, color = Group, fill = Group)) +
+  geom_density(alpha = 0.5) +
+  facet_wrap(~Variable) +
+  ggtitle("Plot of skeptic data")
+plot_informed_vars 
+plot_skeptic_vars
+```
+
+
+## Part II - ML pipeline on simulated data
+
+On the two simulated datasets (separately) build a machine learning pipeline: 
+i) create a data budget (e.g. balanced training and test sets); 
+ii) pre-process the data (e.g. scaling the features); 
+iii) fit and assess a classification algorithm on the training data (e.g. Bayesian multilevel logistic regression); 
+iv) assess performance on the test set; 
+v) discuss whether performance is as expected and feature importance is as expected.
+
+
+*Data budgeting*
+```{r}
+TestID <- sample(seq(n), 20) 
+
+train_informed <- d_informed_wide %>% 
+  subset(!(ID %in% TestID))
+
+test_informed <- d_informed_wide %>%
+  subset(ID %in% TestID) 
+
+train_skeptic <- d_skeptic_wide %>% 
+  subset(!(ID %in% TestID))
+
+test_skeptic <- d_skeptic_wide %>%
+  subset(ID %in% TestID)
+```
+
+
+*Scaling the features of the simulated data*
+```{r}
+rec_informed <- train_informed %>%
+  recipe(Group ~ . ) %>%        
+  step_scale(all_numeric() ) %>% 
+  step_center(all_numeric() ) %>% 
+  prep(training = train_informed, retain = TRUE)
+
+rec_skeptic <- train_skeptic %>%
+  recipe(Group ~ . ) %>%        
+  step_scale(all_numeric() ) %>% 
+  step_center(all_numeric() ) %>% 
+  prep(training = train_skeptic, retain = TRUE)
+
+
+train_informed_s <- juice(rec_informed)
+test_informed_s <- bake(rec_informed, new_data = test_informed, all_predictors()) %>% 
+  mutate(Group = test_informed$Group)
+
+train_skeptic_s <- juice(rec_skeptic)
+test_skeptic_s <- bake(rec_skeptic, new_data = test_skeptic, all_predictors()) %>% 
+  mutate(Group = test_skeptic$Group)
+
+```
+
+
+*Defining our models*
+```{r}
+#Fixed effects:
+p_range_f_1 <- bf(Group ~ 1 + v2 + v1 + v3 + v4 + v5 + v6 + v7 + v8 + v9 + v10) 
+get_prior(p_range_f_1, train_informed_s, family = bernoulli)
+
+p_range_p <- c(
+  prior(normal(0, 1), class = Intercept),
+  prior(normal(0, 0.3), class = b)
+)
+
+#Varying intercepts:
+p_range_f_2 <- bf(Group ~ 1 + v2 + v1 + v3 + v4 + v5 + v6 + v7 + v8 + v9 + v10 + (1|ID))
+get_prior(p_range_f_2, train_informed_s, family = bernoulli)
+
+p_range_p_2 <- c(
+  prior(normal(0, 1), class = Intercept),
+  prior(normal(0, 0.3), class = b),
+  prior(normal(0, 0.3), class = sd)
+)
+
+#Varying slopes 
+p_range_f_3 <- bf(Group ~ 1 + v2 + v1 + v3 + v4 + v5 + v6 + v7 + v8 + v9 + v10 + (1 + v2 + v1 + v3 + v4 + v5 + v6 + v7 + v8 + v9 + v10|ID))
+get_prior(p_range_f_3, train_informed_s, family = bernoulli)
+
+p_range_p_3 <- c(
+  prior(normal(0, 1), class = Intercept),
+  prior(normal(0, 0.3), class = b),
+  prior(normal(0, 0.3), class = sd),
+  prior(lkj(2), class = cor)
+) 
+
+```
+
+
+*Posterior predictive check informed data, fixed effects*
+```{r}
+pitch_m_informed <- brm(
+  p_range_f_1, 
+  data = train_informed_s, 
+  family = bernoulli,
+  prior = p_range_p, 
+  sample_prior = T, 
+  backend = "cmdstanr",
+  threads = threading(2), 
+  chains = 2, 
+  core = 2, 
+  control = list(adapt_delt = 0.99, max_treedepth = 20))
+pp_check(pitch_m_informed, ndraws=100) + labs(title = "Posterior predictive check - train_informed")
+
+informed_draws <- as_draws_df(pitch_m_informed)
+```
+
+
+*Prior-posterior update checks informed data, fixed effect*
+```{r}
+#variables(informed_draws)
+informed_pp_intercept <- ggplot(informed_draws) +
+  geom_histogram(aes(prior_Intercept), fill="black", color="black",alpha=0.6,) +
+  geom_histogram(aes(b_Intercept), fill="#E68613", color="#E68613",alpha=0.6) + 
+  theme_classic() +
+   xlab("Prior-posterior update check on intercept")
+informed_pp_intercept
+
+informed_pp_b_v1 <- ggplot(informed_draws) +
+  geom_histogram(aes(prior_b), fill="black", color="black",alpha=0.6,) +
+  geom_histogram(aes(b_v1), fill="#E68613", color="#E68613",alpha=0.6) + 
+  theme_classic() +
+   xlab("b_v1")
+
+informed_pp_b_v2 <- ggplot(informed_draws) +
+  geom_histogram(aes(prior_b), fill="black", color="black",alpha=0.6,) +
+  geom_histogram(aes(b_v2), fill="#E68613", color="#E68613",alpha=0.6) + 
+  theme_classic() +
+   xlab("b_v2") 
+
+
+informed_pp_b_v3 <- ggplot(informed_draws) +
+  geom_histogram(aes(prior_b), fill="black", color="black",alpha=0.6,) +
+  geom_histogram(aes(b_v3), fill="#E68613", color="#E68613",alpha=0.6) + 
+  theme_classic() +
+   xlab("b_v3") 
+
+informed_pp_b_v4 <- ggplot(informed_draws) +
+  geom_histogram(aes(prior_b), fill="black", color="black",alpha=0.6,) +
+  geom_histogram(aes(b_v4), fill="#E68613", color="#E68613",alpha=0.6) + 
+  theme_classic() +
+   xlab("b_v4")
+
+informed_pp_b_v5 <- ggplot(informed_draws) +
+  geom_histogram(aes(prior_b), fill="black", color="black",alpha=0.6,) +
+  geom_histogram(aes(b_v5), fill="#E68613", color="#E68613",alpha=0.6) + 
+  theme_classic() +
+   xlab("b_v5") 
+
+informed_pp_b_v6 <- ggplot(informed_draws) +
+  geom_histogram(aes(prior_b), fill="black", color="black",alpha=0.6,) +
+  geom_histogram(aes(b_v6), fill="#E68613", color="#E68613",alpha=0.6) + 
+  theme_classic() +
+   xlab("b_v6") 
+
+informed_pp_b_v7 <- ggplot(informed_draws) +
+  geom_histogram(aes(prior_b), fill="black", color="black",alpha=0.6,) +
+  geom_histogram(aes(b_v7), fill="#E68613", color="#E68613",alpha=0.6) + 
+  theme_classic() +
+   xlab("b_v7") 
+
+informed_pp_b_v8 <- ggplot(informed_draws) +
+  geom_histogram(aes(prior_b), fill="black", color="black",alpha=0.6,) +
+  geom_histogram(aes(b_v8), fill="#E68613", color="#E68613",alpha=0.6) + 
+  theme_classic() +
+   xlab("b_v8") 
+
+informed_pp_b_v9 <- ggplot(informed_draws) +
+  geom_histogram(aes(prior_b), fill="black", color="black",alpha=0.6,) +
+  geom_histogram(aes(b_v9), fill="#E68613", color="#E68613",alpha=0.6) + 
+  theme_classic() +
+   xlab("b_v9")
+
+informed_pp_b_v10 <- ggplot(informed_draws) +
+  geom_histogram(aes(prior_b), fill="black", color="black",alpha=0.6,) +
+  geom_histogram(aes(b_v10), fill="#E68613", color="#E68613",alpha=0.6) + 
+  theme_classic() +
+   xlab("b_v10") 
+
+grid.arrange(informed_pp_b_v1, informed_pp_b_v2, informed_pp_b_v3, informed_pp_b_v4, informed_pp_b_v5, informed_pp_b_v6, informed_pp_b_v7, informed_pp_b_v8, informed_pp_b_v9, informed_pp_b_v10)
+
+```
+
+
+*Posterior predictive check informed data, varying intercept*
+```{r}
+pitch_m_informed_2 <- brm(
+  p_range_f_2, 
+  data = train_informed_s, 
+  family = bernoulli,
+  prior = p_range_p_2, 
+  sample_prior = T, 
+  backend = "cmdstanr",
+  threads = threading(2), 
+  chains = 2, 
+  core = 2, 
+  control = list(adapt_delt = 0.99, max_treedepth = 20))
+pp_check(pitch_m_informed_2, ndraws=100) + labs(title = "Posterior-predictive check - train_informed - (1|ID)")
+
+informed_draws_2 <- as_draws_df(pitch_m_informed_2)
+```
+
+
+*Prior-posterior update checks informed data, varying intercept*
+```{r}
+#variables(informed_draws_2)
+informed_pp_sd_2 <- ggplot(informed_draws_2) +
+  geom_histogram(aes(prior_sd_ID), fill="black", color="black",alpha=0.6,) +
+  geom_histogram(aes(sd_ID__Intercept), fill="#E68613", color="#E68613",alpha=0.6) + 
+  theme_classic() +
+   xlab("Prior-posterior update check on intercept")
+
+
+informed_pp_intercept_2 <- ggplot(informed_draws_2) +
+  geom_histogram(aes(prior_Intercept), fill="black", color="black",alpha=0.6,) +
+  geom_histogram(aes(b_Intercept), fill="#E68613", color="#E68613",alpha=0.6) + 
+  theme_classic() +
+   xlab("Prior-posterior update check on intercept")
+
+informed_pp_b_v1_2 <- ggplot(informed_draws_2) +
+  geom_histogram(aes(prior_b), fill="black", color="black",alpha=0.6,) +
+  geom_histogram(aes(b_v1), fill="#E68613", color="#E68613",alpha=0.6) + 
+  theme_classic() +
+   xlab("b_v1")
+
+informed_pp_b_v2_2 <- ggplot(informed_draws_2) +
+  geom_histogram(aes(prior_b), fill="black", color="black",alpha=0.6,) +
+  geom_histogram(aes(b_v2), fill="#E68613", color="#E68613",alpha=0.6) +
+  theme_classic() +
+   xlab("b_v2") 
+
+
+informed_pp_b_v3_2 <- ggplot(informed_draws_2) +
+  geom_histogram(aes(prior_b), fill="black", color="black",alpha=0.6,) +
+  geom_histogram(aes(b_v3), fill="#E68613", color="#E68613",alpha=0.6) + 
+  theme_classic() +
+   xlab("b_v3") 
+
+informed_pp_b_v4_2 <- ggplot(informed_draws_2) +
+  geom_histogram(aes(prior_b), fill="black", color="black",alpha=0.6,) +
+  geom_histogram(aes(b_v4), fill="#E68613", color="#E68613",alpha=0.6) + 
+  theme_classic() +
+   xlab("b_v4")
+
+informed_pp_b_v5_2 <- ggplot(informed_draws_2) +
+  geom_histogram(aes(prior_b), fill="black", color="black",alpha=0.6,) +
+  geom_histogram(aes(b_v5), fill="#E68613", color="#E68613",alpha=0.6) + 
+  theme_classic() +
+   xlab("b_v5") 
+
+informed_pp_b_v6_2 <- ggplot(informed_draws_2) +
+  geom_histogram(aes(prior_b), fill="black", color="black",alpha=0.6,) +
+  geom_histogram(aes(b_v6), fill="#E68613", color="#E68613",alpha=0.6) + 
+  theme_classic() +
+   xlab("b_v6") 
+
+informed_pp_b_v7_2 <- ggplot(informed_draws_2) +
+  geom_histogram(aes(prior_b), fill="black", color="black",alpha=0.6,) +
+  geom_histogram(aes(b_v7), fill="#E68613", color="#E68613",alpha=0.6) + 
+  theme_classic() +
+   xlab("b_v7") 
+
+informed_pp_b_v8_2 <- ggplot(informed_draws_2) +
+  geom_histogram(aes(prior_b), fill="black", color="black",alpha=0.6,) +
+  geom_histogram(aes(b_v8), fill="#E68613", color="#E68613",alpha=0.6) + 
+  theme_classic() +
+   xlab("b_v8") 
+
+informed_pp_b_v9_2 <- ggplot(informed_draws_2) +
+  geom_histogram(aes(prior_b), fill="black", color="black",alpha=0.6,) +
+  geom_histogram(aes(b_v9), fill="#E68613", color="#E68613",alpha=0.6) + 
+  theme_classic() +
+   xlab("b_v9")
+
+informed_pp_b_v10_2 <- ggplot(informed_draws_2) +
+  geom_histogram(aes(prior_b), fill="black", color="black",alpha=0.6,) +
+  geom_histogram(aes(b_v10), fill="#E68613", color="#E68613",alpha=0.6) + 
+  theme_classic() +
+   xlab("b_v10") 
+
+p1_10_m2 <- grid.arrange(informed_pp_b_v1_2, informed_pp_b_v2_2, informed_pp_b_v3_2, informed_pp_b_v4_2, informed_pp_b_v5_2, informed_pp_b_v6_2, informed_pp_b_v7_2, informed_pp_b_v8_2, informed_pp_b_v9_2, informed_pp_b_v10_2)
+
+
+```
+
+
+*Posterior predictive check informed data, varying slope*
+```{r}
+pitch_m_informed_3 <- brm(
+  p_range_f_3, 
+  data = train_informed_s, 
+  family = bernoulli,
+  prior = p_range_p_3, 
+  sample_prior = T, 
+  backend = "cmdstanr",
+  threads = threading(2), 
+  chains = 2, 
+  core = 2, 
+  control = list(adapt_delt = 0.99, max_treedepth = 20))
+pp_check(pitch_m_informed_2, ndraws=100) + labs(title = "Posterior-predictive check - train_informed - random slopes")
+
+informed_draws_3 <- as_draws_df(pitch_m_informed_3)
+```
+
+
+*Prior-posterior update checks informed data, varying slope*
+```{r}
+#variables(informed_draws_3)
+informed_pp_sd_3 <- ggplot(informed_draws_3) +
+  geom_histogram(aes(prior_sd_ID), fill="black", color="black",alpha=0.6,) +
+  geom_histogram(aes(sd_ID__Intercept), fill="#E68613", color="#E68613",alpha=0.6) + 
+  theme_classic() +
+   xlab("Prior-posterior update check on intercept")
+
+
+informed_pp_intercept_3 <- ggplot(informed_draws_3) +
+  geom_histogram(aes(prior_Intercept), fill="black", color="black",alpha=0.6,) +
+  geom_histogram(aes(b_Intercept), fill="#E68613", color="#E68613",alpha=0.6) + 
+  theme_classic() +
+   xlab("Prior-posterior update check on intercept")
+
+informed_pp_b_v1_3 <- ggplot(informed_draws_3) +
+  geom_histogram(aes(prior_b), fill="black", color="black",alpha=0.6,) +
+  geom_histogram(aes(b_v1), fill="#E68613", color="#E68613",alpha=0.6) + 
+  theme_classic() +
+   xlab("b_v1")
+
+informed_pp_b_v2_3 <- ggplot(informed_draws_3) +
+  geom_histogram(aes(prior_b), fill="black", color="black",alpha=0.6,) +
+  geom_histogram(aes(b_v2), fill="#E68613", color="#E68613",alpha=0.6) + 
+  theme_classic() +
+   xlab("b_v2") 
+
+informed_pp_b_v3_3 <- ggplot(informed_draws_3) +
+  geom_histogram(aes(prior_b), fill="black", color="black",alpha=0.6,) +
+  geom_histogram(aes(b_v3), fill="#E68613", color="#E68613",alpha=0.6) + 
+  theme_classic() +
+   xlab("b_v3") 
+
+informed_pp_b_v4_3 <- ggplot(informed_draws_3) +
+  geom_histogram(aes(prior_b), fill="black", color="black",alpha=0.6,) +
+  geom_histogram(aes(b_v4), fill="#E68613", color="#E68613",alpha=0.6) + 
+  theme_classic() +
+   xlab("b_v4")
+
+informed_pp_b_v5_3 <- ggplot(informed_draws_3) +
+  geom_histogram(aes(prior_b), fill="black", color="black",alpha=0.6,) +
+  geom_histogram(aes(b_v5), fill="#E68613", color="#E68613",alpha=0.6) + 
+  theme_classic() +
+   xlab("b_v5") 
+
+informed_pp_b_v6_3 <- ggplot(informed_draws_3) +
+  geom_histogram(aes(prior_b), fill="black", color="black",alpha=0.6,) +
+  geom_histogram(aes(b_v6), fill="#E68613", color="#E68613",alpha=0.6) + 
+  theme_classic() +
+   xlab("b_v6") 
+
+informed_pp_b_v7_3 <- ggplot(informed_draws_3) +
+  geom_histogram(aes(prior_b), fill="black", color="black",alpha=0.6,) +
+  geom_histogram(aes(b_v7), fill="#E68613", color="#E68613",alpha=0.6) + 
+  theme_classic() +
+   xlab("b_v7") 
+
+informed_pp_b_v8_3 <- ggplot(informed_draws_3) +
+  geom_histogram(aes(prior_b), fill="black", color="black",alpha=0.6,) +
+  geom_histogram(aes(b_v8), fill="#E68613", color="#E68613",alpha=0.6) + 
+  theme_classic() +
+   xlab("b_v8") 
+
+informed_pp_b_v9_3 <- ggplot(informed_draws_3) +
+  geom_histogram(aes(prior_b), fill="black", color="black",alpha=0.6,) +
+  geom_histogram(aes(b_v9), fill="#E68613", color="#E68613",alpha=0.6) + 
+  theme_classic() +
+   xlab("b_v9")
+
+informed_pp_b_v10_3 <- ggplot(informed_draws_3) +
+  geom_histogram(aes(prior_b), fill="black", color="black",alpha=0.6,) +
+  geom_histogram(aes(b_v10), fill="#E68613", color="#E68613",alpha=0.6) +
+  theme_classic() +
+   xlab("b_v10") 
+
+grid.arrange(informed_pp_b_v1_3, informed_pp_b_v2_3, informed_pp_b_v3_3, informed_pp_b_v4_3, informed_pp_b_v5_3, informed_pp_b_v6_3, informed_pp_b_v7_3, informed_pp_b_v8_3, informed_pp_b_v9_3, informed_pp_b_v10_3)
+
+```
+
+
+*Skeptic data, fixed effects*
+```{r}
+pitch_m_skeptic <- brm(
+  p_range_f_1, 
+  data = train_skeptic_s, 
+  family = bernoulli,
+  prior = p_range_p, 
+  sample_prior = T, 
+  backend = "cmdstanr",
+  threads = threading(2), 
+  chains = 2, 
+  core = 2, 
+  control = list(adapt_delt = 0.99, max_treedepth = 20))
+
+pp_check(pitch_m_skeptic, ndraws=100) + labs(title = "Posterior-predictive check - train_skeptic")
+
+skeptic_draws <- as_draws_df(pitch_m_skeptic)
+#variables(skeptic_draws)
+
+skeptic_pp_intercept <- ggplot(skeptic_draws) +
+  geom_histogram(aes(prior_Intercept), fill="black", color="black",alpha=0.6,) +
+  geom_histogram(aes(b_Intercept), fill="#E68613", color="#E68613",alpha=0.6) +
+  theme_classic() +
+   xlab("Prior-posterior update check on intercept")
+
+skeptic_pp_b_v2 <- ggplot(skeptic_draws) +
+  geom_histogram(aes(prior_b), fill="black", color="black",alpha=0.6,) +
+  geom_histogram(aes(b_v2), fill="#E68613", color="#E68613",alpha=0.6) +
+  theme_classic() +
+   xlab("Prior-posterior update check on b_v2")
+skeptic_pp_intercept
+skeptic_pp_b_v2
+```
+
+*Skeptic data, varying intercept*
+```{r}
+pitch_m_skeptic_2 <- brm(
+  p_range_f_2, 
+  data = train_skeptic_s, 
+  family = bernoulli,
+  prior = p_range_p_2, 
+  sample_prior = T, 
+  backend = "cmdstanr",
+  threads = threading(2), 
+  chains = 2, 
+  core = 2, 
+  control = list(adapt_delt = 0.99, max_treedepth = 20))
+pp_check(pitch_m_informed_2, ndraws=100) + labs(title = "Posterior-predictive check - train_skeptic - (1|ID)")
+```
+
+
+*Skeptic data, varying slope*
+```{r}
+pitch_m_skeptic_3 <- brm(
+  p_range_f_3, 
+  data = train_skeptic_s, 
+  family = bernoulli,
+  prior = p_range_p_3, 
+  sample_prior = T, 
+  backend = "cmdstanr",
+  threads = threading(2), 
+  chains = 2, 
+  core = 2, 
+  control = list(adapt_delt = 0.99, max_treedepth = 20))
+pp_check(pitch_m_informed_3, ndraws=100) + labs(title = "Posterior-predictive check - train_skeptic - random slopes")
+```
+
+
+*Calculating accuracy of the informed models*
+```{r}
+train_informed_s$PredictionsPerc0 <- predict(pitch_m_informed)[, 1]
+train_informed_s$Predictions0[train_informed_s$PredictionsPerc0 > 0.5] <- "Schizophrenia"
+train_informed_s$Predictions0[train_informed_s$PredictionsPerc0 <= 0.5] <- "Control"
+
+train_informed_s$PredictionsPerc1 <- predict(pitch_m_informed_2)[, 1]
+train_informed_s$Predictions1[train_informed_s$PredictionsPerc1 > 0.5] <- "Schizophrenia"
+train_informed_s$Predictions1[train_informed_s$PredictionsPerc1 <= 0.5] <- "Control"
+
+train_informed_s$PredictionsPerc2 <- predict(pitch_m_informed_3)[, 1]
+train_informed_s$Predictions2[train_informed_s$PredictionsPerc2 > 0.5] <- "Schizophrenia"
+train_informed_s$Predictions2[train_informed_s$PredictionsPerc2 <= 0.5] <- "Control"
+
+train_informed_s <- train_informed_s %>%
+  mutate(
+    Group  = as.factor(Group),
+    Predictions0 = as.factor(Predictions0),
+    Predictions1 = as.factor(Predictions1),
+    Predictions2 = as.factor(Predictions2)
+  )
+
+test_informed_s$PredictionsPerc0 <- predict(pitch_m_informed, newdata = test_informed_s, allow_new_levels = T)[, 1] 
+test_informed_s$Predictions0[test_informed_s$PredictionsPerc0 > 0.5] <- "Schizophrenia"
+test_informed_s$Predictions0[test_informed_s$PredictionsPerc0 <= 0.5] <- "Control"
+
+test_informed_s$PredictionsPerc1 <- predict(pitch_m_informed_2, newdata = test_informed_s, allow_new_levels = T)[, 1] 
+test_informed_s$Predictions1[test_informed_s$PredictionsPerc1 > 0.5] <- "Schizophrenia"
+test_informed_s$Predictions1[test_informed_s$PredictionsPerc1 <= 0.5] <- "Control"
+
+test_informed_s$PredictionsPerc2 <- predict(pitch_m_informed_3, newdata = test_informed_s, allow_new_levels = T)[, 1] 
+test_informed_s$Predictions2[test_informed_s$PredictionsPerc2 > 0.5] <- "Schizophrenia"
+test_informed_s$Predictions2[test_informed_s$PredictionsPerc2 <= 0.5] <- "Control"
+
+test_informed_s <- test_informed_s %>%
+  mutate(
+    Group  = as.factor(Group),
+    Predictions0 = as.factor(Predictions0),
+    Predictions1 = as.factor(Predictions1),
+    Predictions2 = as.factor(Predictions2)
+  )
+```
+
+
+*Calculating accuracy of skeptic models*
+```{r}
+train_skeptic_s$PredictionsPerc0 <- predict(pitch_m_skeptic)[, 1]  
+train_skeptic_s$Predictions0[train_skeptic_s$PredictionsPerc0 > 0.5] <- "Schizophrenia"
+train_skeptic_s$Predictions0[train_skeptic_s$PredictionsPerc0 <= 0.5] <- "Control"
+
+train_skeptic_s$PredictionsPerc1 <- predict(pitch_m_skeptic_2)[, 1]  
+train_skeptic_s$Predictions1[train_skeptic_s$PredictionsPerc1 > 0.5] <- "Schizophrenia"
+train_skeptic_s$Predictions1[train_skeptic_s$PredictionsPerc1 <= 0.5] <- "Control"
+
+train_skeptic_s$PredictionsPerc2 <- predict(pitch_m_skeptic_3)[, 1]  
+train_skeptic_s$Predictions2[train_skeptic_s$PredictionsPerc2 > 0.5] <- "Schizophrenia"
+train_skeptic_s$Predictions2[train_skeptic_s$PredictionsPerc2 <= 0.5] <- "Control"
+
+train_skeptic_s <- train_skeptic_s %>%
+  mutate(
+    Group  = as.factor(Group),
+    Predictions0 = as.factor(Predictions0),
+    Predictions1 = as.factor(Predictions1),
+    Predictions2 = as.factor(Predictions2)
+  )
+
+test_skeptic_s$PredictionsPerc0 <- predict(pitch_m_skeptic, newdata = test_skeptic_s, allow_new_levels = T)[, 1]
+test_skeptic_s$Predictions0[test_skeptic_s$PredictionsPerc0 > 0.5] <- "Schizophrenia"
+test_skeptic_s$Predictions0[test_skeptic_s$PredictionsPerc0 <= 0.5] <- "Control"
+
+test_skeptic_s$PredictionsPerc1 <- predict(pitch_m_skeptic_2, newdata = test_skeptic_s, allow_new_levels = T)[, 1]
+test_skeptic_s$Predictions1[test_skeptic_s$PredictionsPerc1 > 0.5] <- "Schizophrenia"
+test_skeptic_s$Predictions1[test_skeptic_s$PredictionsPerc1 <= 0.5] <- "Control"
+
+test_skeptic_s$PredictionsPerc2 <- predict(pitch_m_skeptic_3, newdata = test_skeptic_s, allow_new_levels = T)[, 1]
+test_skeptic_s$Predictions2[test_skeptic_s$PredictionsPerc2 > 0.5] <- "Schizophrenia"
+test_skeptic_s$Predictions2[test_skeptic_s$PredictionsPerc2 <= 0.5] <- "Control"
+
+test_skeptic_s <- test_skeptic_s %>%
+  mutate(
+    Group  = as.factor(Group),
+    Predictions0 = as.factor(Predictions0),
+    Predictions1 = as.factor(Predictions1),
+    Predictions2 = as.factor(Predictions2)
+  )
+
+```
+
+
+*Accuracy of all models on train and test data*
+```{r}
+#INFORMED: TRAINING DATA
+conf_mat(train_informed_s, truth = Group, estimate = Predictions0, dnn = c("Prediction", "Truth"))
+metrics(train_informed_s, truth = Group, estimate = Predictions0) %>%
+  knitr::kable()
+conf_mat(train_informed_s, truth = Group, estimate = Predictions1, dnn = c("Prediction", "Truth"))
+metrics(train_informed_s, truth = Group, estimate = Predictions1) %>%
+  knitr::kable()
+conf_mat(train_informed_s, truth = Group, estimate = Predictions2, dnn = c("Prediction", "Truth"))
+metrics(train_informed_s, truth = Group, estimate = Predictions2) %>%
+  knitr::kable()
+
+#INFORMED: TEST DATA
+conf_mat(test_informed_s, truth = Group, estimate = Predictions0, dnn = c("Prediction", "Truth"))
+metrics(test_informed_s, truth = Group, estimate = Predictions0) %>%
+  knitr::kable()
+conf_mat(test_informed_s, truth = Group, estimate = Predictions1, dnn = c("Prediction", "Truth"))
+metrics(test_informed_s, truth = Group, estimate = Predictions1) %>%
+  knitr::kable()
+conf_mat(test_informed_s, truth = Group, estimate = Predictions2, dnn = c("Prediction", "Truth"))
+metrics(test_informed_s, truth = Group, estimate = Predictions2) %>%
+  knitr::kable()
+
+#SKEPTIC: TRAINING DATA
+conf_mat(train_skeptic_s, truth = Group, estimate = Predictions0, dnn = c("Prediction", "Truth"))
+metrics(train_skeptic_s, truth = Group, estimate = Predictions0) %>%
+  knitr::kable()
+conf_mat(train_skeptic_s, truth = Group, estimate = Predictions1, dnn = c("Prediction", "Truth"))
+metrics(train_skeptic_s, truth = Group, estimate = Predictions1) %>%
+  knitr::kable()
+conf_mat(train_skeptic_s, truth = Group, estimate = Predictions2, dnn = c("Prediction", "Truth"))
+metrics(train_skeptic_s, truth = Group, estimate = Predictions2) %>%
+  knitr::kable()
+
+#SKEPTIC: TEST DATA
+conf_mat(test_skeptic_s, truth = Group, estimate = Predictions0, dnn = c("Prediction", "Truth"))
+metrics(test_skeptic_s, truth = Group, estimate = Predictions0) %>%
+  knitr::kable()
+conf_mat(test_skeptic_s, truth = Group, estimate = Predictions1, dnn = c("Prediction", "Truth"))
+metrics(test_skeptic_s, truth = Group, estimate = Predictions1) %>%
+  knitr::kable()
+conf_mat(test_skeptic_s, truth = Group, estimate = Predictions2, dnn = c("Prediction", "Truth"))
+metrics(test_skeptic_s, truth = Group, estimate = Predictions2) %>%
+  knitr::kable()
+```
+
+
+
+```{r}
+PerformanceProb <- tibble(expand_grid( 
+  Sample = seq(2000),
+  Model = c("FixedEffects", "VaryingIntercept", "VaryingSlope"),
+  Setup = c("Informed", "Skeptic"), 
+  Type = c("Training", "Test")
+))
+
+#Informed: fixed effects
+train0 <- inv_logit_scaled(posterior_linpred(pitch_m_informed, summary = F)) 
+test0 <- inv_logit_scaled(posterior_linpred(pitch_m_informed, summary = F,
+                                            newdata = test_informed_s, allow_new_levels = T))
+
+for (i in seq(2000)) {
+  train_informed_s$Predictions0 <- as.factor(ifelse(train0[i,]> 0.5, "Schizophrenia", "Control"))
+  test_informed_s$Predictions0 <- as.factor(ifelse(test0[i,]> 0.5, "Schizophrenia", "Control"))
+  
+  PerformanceProb$Accuracy[PerformanceProb$Sample == i & PerformanceProb$Model == "FixedEffects" &
+                             PerformanceProb$Setup == "Informed" & PerformanceProb$Type == "Training"] <- accuracy(train_informed_s, truth = Group, estimate = Predictions0)[, ".estimate"]
+  
+    PerformanceProb$Accuracy[PerformanceProb$Sample == i & PerformanceProb$Model == "FixedEffects" &
+                             PerformanceProb$Setup == "Informed" & PerformanceProb$Type == "Test"] <- accuracy(test_informed_s, truth = Group, estimate = Predictions0)[, ".estimate"]
+  
+}
+
+#Informed: varying intercepts
+train1 <- inv_logit_scaled(posterior_linpred(pitch_m_informed_2, summary = F)) 
+test1 <- inv_logit_scaled(posterior_linpred(pitch_m_informed_2, summary = F,
+                                            newdata = test_informed_s, allow_new_levels = T))
+
+for (i in seq(2000)) {
+  train_informed_s$Predictions1 <- as.factor(ifelse(train1[i,]> 0.5, "Schizophrenia", "Control"))
+  test_informed_s$Predictions1 <- as.factor(ifelse(test1[i,]> 0.5, "Schizophrenia", "Control"))
+  
+  PerformanceProb$Accuracy[PerformanceProb$Sample == i & PerformanceProb$Model == "VaryingIntercept" &
+                             PerformanceProb$Setup == "Informed" & PerformanceProb$Type == "Training"] <- accuracy(train_informed_s, truth = Group, estimate = Predictions1)[, ".estimate"]
+  
+    PerformanceProb$Accuracy[PerformanceProb$Sample == i & PerformanceProb$Model == "VaryingIntercept" &
+                             PerformanceProb$Setup == "Informed" & PerformanceProb$Type == "Test"] <- accuracy(test_informed_s, truth = Group, estimate = Predictions1)[, ".estimate"]
+  
+}
+
+#Informed: varying slopes
+train2 <- inv_logit_scaled(posterior_linpred(pitch_m_informed_3, summary = F)) 
+test2 <- inv_logit_scaled(posterior_linpred(pitch_m_informed_3, summary = F,
+                                            newdata = test_informed_s, allow_new_levels = T))
+
+for (i in seq(2000)) {
+  train_informed_s$Predictions2 <- as.factor(ifelse(train2[i,]> 0.5, "Schizophrenia", "Control"))
+  test_informed_s$Predictions2 <- as.factor(ifelse(test2[i,]> 0.5, "Schizophrenia", "Control"))
+  
+  PerformanceProb$Accuracy[PerformanceProb$Sample == i & PerformanceProb$Model == "VaryingSlope" &
+                             PerformanceProb$Setup == "Informed" & PerformanceProb$Type == "Training"] <- accuracy(train_informed_s, truth = Group, estimate = Predictions2)[, ".estimate"]
+  
+    PerformanceProb$Accuracy[PerformanceProb$Sample == i & PerformanceProb$Model == "VaryingSlope" &
+                             PerformanceProb$Setup == "Informed" & PerformanceProb$Type == "Test"] <- accuracy(test_informed_s, truth = Group, estimate = Predictions2)[, ".estimate"]
+  
+}
+
+```
+
+
+
+```{r}
+#Skeptic: fixed effects
+
+train0_s <- inv_logit_scaled(posterior_linpred(pitch_m_skeptic, summary = F)) 
+test0_s <- inv_logit_scaled(posterior_linpred(pitch_m_skeptic, summary = F,
+                                            newdata = test_skeptic_s, allow_new_levels = T))
+
+for (i in seq(2000)) {
+  train_skeptic_s$Predictions0 <- as.factor(ifelse(train0_s[i,]> 0.5, "Schizophrenia", "Control"))
+  test_skeptic_s$Predictions0 <- as.factor(ifelse(test0_s[i,]> 0.5, "Schizophrenia", "Control"))
+  
+  PerformanceProb$Accuracy[PerformanceProb$Sample == i & PerformanceProb$Model == "FixedEffects" &
+                             PerformanceProb$Setup == "Skeptic" & PerformanceProb$Type == "Training"] <- accuracy(train_skeptic_s, truth = Group, estimate = Predictions0)[, ".estimate"]
+  
+    PerformanceProb$Accuracy[PerformanceProb$Sample == i & PerformanceProb$Model == "FixedEffects" &
+                             PerformanceProb$Setup == "Skeptic" & PerformanceProb$Type == "Test"] <- accuracy(test_skeptic_s, truth = Group, estimate = Predictions0)[, ".estimate"]
+  
+}
+#Skeptic: varying intercepts
+train1_s <- inv_logit_scaled(posterior_linpred(pitch_m_skeptic_2, summary = F)) 
+test1_s <- inv_logit_scaled(posterior_linpred(pitch_m_skeptic_2, summary = F,
+                                            newdata = test_skeptic_s, allow_new_levels = T))
+
+for (i in seq(2000)) {
+  train_skeptic_s$Predictions1 <- as.factor(ifelse(train1_s[i,]> 0.5, "Schizophrenia", "Control"))
+  test_skeptic_s$Predictions1 <- as.factor(ifelse(test1_s[i,]> 0.5, "Schizophrenia", "Control"))
+  
+  PerformanceProb$Accuracy[PerformanceProb$Sample == i & PerformanceProb$Model == "VaryingIntercept" &
+                             PerformanceProb$Setup == "Skeptic" & PerformanceProb$Type == "Training"] <- accuracy(train_skeptic_s, truth = Group, estimate = Predictions1)[, ".estimate"]
+  
+    PerformanceProb$Accuracy[PerformanceProb$Sample == i & PerformanceProb$Model == "VaryingIntercept" &
+                             PerformanceProb$Setup == "Skeptic" & PerformanceProb$Type == "Test"] <- accuracy(test_skeptic_s, truth = Group, estimate = Predictions1)[, ".estimate"]
+}
+
+#Skeptic: varying slopes
+train2_s <- inv_logit_scaled(posterior_linpred(pitch_m_skeptic_3, summary = F)) 
+test2_s <- inv_logit_scaled(posterior_linpred(pitch_m_skeptic_3, summary = F,
+                                            newdata = test_skeptic_s, allow_new_levels = T))
+
+for (i in seq(2000)) {
+  train_skeptic_s$Predictions2 <- as.factor(ifelse(train2_s[i,]> 0.5, "Schizophrenia", "Control"))
+  test_skeptic_s$Predictions2 <- as.factor(ifelse(test2_s[i,]> 0.5, "Schizophrenia", "Control"))
+  
+  PerformanceProb$Accuracy[PerformanceProb$Sample == i & PerformanceProb$Model == "VaryingSlope" &
+                             PerformanceProb$Setup == "Skeptic" & PerformanceProb$Type == "Training"] <- accuracy(train_skeptic_s, truth = Group, estimate = Predictions2)[, ".estimate"]
+  
+    PerformanceProb$Accuracy[PerformanceProb$Sample == i & PerformanceProb$Model == "VaryingSlope" &
+                             PerformanceProb$Setup == "Skeptic" & PerformanceProb$Type == "Test"] <- accuracy(test_skeptic_s, truth = Group, estimate = Predictions2)[, ".estimate"]
+}
+
+```
+
+
+*Plot of accuracy in classification*
+```{r}
+PerformanceProb <- PerformanceProb %>%
+  mutate(
+    Model = as.factor(Model),
+    Type = as.factor(Type),
+    Setup = as.factor(Setup),
+    Accuracy= as.numeric(Accuracy)
+  )
+
+performance_1 <- ggplot(data=PerformanceProb, aes(x=Model, y=Accuracy, color = Type)) +
+  geom_point(alpha = 0.05) +
+  facet_wrap(~Setup) +
+  stat_summary(geom = "line", fun = mean)
+
+performance_1
+```
+
+
+
+
+
+*Plotting feature importance for all variable in each informed model*
+```{r}
+library(reshape)
+#Model with fixed intercepts
+
+f_in <- as_draws_df(pitch_m_informed)
+
+  
+p_v2 <- ggplot(f_in, aes(x=b_v2)) + 
+  geom_vline(xintercept = -0.55, colour="red", linetype = "longdash") + 
+  geom_density() + xlab("Pitch variability: v2")
+
+p_v1 <- ggplot(f_in, aes(x=b_v1)) + 
+  geom_vline(xintercept = -1.26, colour="red", linetype = "longdash") + 
+  geom_density() + xlab("Proportion of spoken time: v1")
+
+p_v3 <- ggplot(f_in, aes(x=b_v3)) + 
+  geom_vline(xintercept = -0.75, colour="red", linetype = "longdash") + 
+  geom_density() + xlab("Speech rate: v3")
+
+p_v4 <- ggplot(f_in, aes(x=b_v4)) + 
+  geom_vline(xintercept = 1.89, colour="red", linetype = "longdash") + 
+  geom_density() + xlab("Duration of pauses: v4")
+
+p_v5 <- ggplot(f_in, aes(x=b_v5)) + 
+  geom_vline(xintercept = 0.25, colour="red", linetype = "longdash") + 
+  geom_density() + xlab("Pitch mean: v5")
+
+p_v6 <- ggplot(f_in, aes(x=b_v6)) + 
+  geom_vline(xintercept = 0.05, colour="red", linetype = "longdash") + 
+  geom_density() + xlab("Number of pauses: v6")
+
+p_v7 <- ggplot(f_in, aes(x=b_v7)) + 
+  geom_vline(xintercept = 0, colour="red", linetype = "longdash") + 
+  geom_density()
+
+p_v8 <- ggplot(f_in, aes(x=b_v8)) + 
+  geom_vline(xintercept = 0, colour="red", linetype = "longdash") + 
+  geom_density()
+
+p_v9 <- ggplot(f_in, aes(x=b_v9)) + 
+  geom_vline(xintercept = 0, colour="red", linetype = "longdash") + 
+  geom_density()
+
+p_v10 <- ggplot(f_in, aes(x=b_v10)) + 
+  geom_vline(xintercept = 0, colour="red", linetype = "longdash") + 
+  geom_density()
+
+grid.arrange(p_v1, p_v2, p_v3, p_v4, p_v5, p_v6, p_v7, p_v8, p_v9, p_v10)
+
+
+
+#Model with Varying intercept:
+v_int <- as_draws_df(pitch_m_informed_2)
+
+
+p_v1_v <- ggplot(v_int, aes(x=b_v1)) + 
+  geom_vline(xintercept = -1.26, colour="red", linetype = "longdash") + 
+  geom_density() + xlab("Proportion of spoken time: v1")
+
+p_v2_v <- ggplot(v_int, aes(x=b_v2)) + 
+  geom_vline(xintercept = -0.55, colour="red", linetype = "longdash") + 
+  geom_density() + xlab("Pitch variability: v2")
+
+p_v3_v <- ggplot(v_int, aes(x=b_v3)) + 
+  geom_vline(xintercept = -0.75, colour="red", linetype = "longdash") + 
+  geom_density() + xlab("Speech rate: v3")
+
+p_v4_v <- ggplot(v_int, aes(x=b_v4)) + 
+  geom_vline(xintercept = 1.89, colour="red", linetype = "longdash") + 
+  geom_density() + xlab("Duration of pauses: v4")
+
+p_v5_v <- ggplot(v_int, aes(x=b_v5)) + 
+  geom_vline(xintercept = 0.25, colour="red", linetype = "longdash") + 
+  geom_density() + xlab("Pitch mean: v5")
+
+p_v6_v <- ggplot(v_int, aes(x=b_v6)) + 
+  geom_vline(xintercept = 0.05, colour="red", linetype = "longdash") + 
+  geom_density() + xlab("Number of pauses: v6")
+
+p_v7_v <- ggplot(v_int, aes(x=b_v7)) + 
+  geom_vline(xintercept = 0, colour="red", linetype = "longdash") + 
+  geom_density()
+
+p_v8_v <- ggplot(v_int, aes(x=b_v8)) + 
+  geom_vline(xintercept = 0, colour="red", linetype = "longdash") + 
+  geom_density()
+
+p_v9_v <- ggplot(v_int, aes(x=b_v9)) + 
+  geom_vline(xintercept = 0, colour="red", linetype = "longdash") + 
+  geom_density()
+
+p_v10_v <- ggplot(v_int, aes(x=b_v10)) + 
+  geom_vline(xintercept = 0, colour="red", linetype = "longdash") + 
+  geom_density()
+
+grid.arrange(p_v1_v, p_v2_v, p_v3_v, p_v4_v, p_v5_v, p_v6_v, p_v7_v, p_v8_v, p_v9_v, p_v10_v)
+
+#Model with Varying slopes:
+v_sl <- as_draws_df(pitch_m_informed_3)
+
+p_v1_s <- ggplot(v_sl, aes(x=b_v1)) + 
+  geom_vline(xintercept = -1.26, colour="red", linetype = "longdash") + 
+  geom_density() + xlab("Proportion of spoken time: v1")
+
+p_v2_s <- ggplot(v_sl, aes(x=b_v2)) + 
+  geom_vline(xintercept = -0.55, colour="red", linetype = "longdash") + 
+  geom_density() + xlab("Pitch variability: v2")
+
+p_v3_s <- ggplot(v_sl, aes(x=b_v3)) + 
+  geom_vline(xintercept = -0.75, colour="red", linetype = "longdash") + 
+  geom_density() + xlab("Speech rate: v3")
+
+p_v4_s <- ggplot(v_sl, aes(x=b_v4)) + 
+  geom_vline(xintercept = 1.89, colour="red", linetype = "longdash") + 
+  geom_density() + xlab("Duration of pauses: v4")
+
+p_v5_s <- ggplot(v_sl, aes(x=b_v5)) + 
+  geom_vline(xintercept = 0.25, colour="red", linetype = "longdash") + 
+  geom_density() + xlab("Pitch mean: v5")
+
+p_v6_s <- ggplot(v_sl, aes(x=b_v6)) + 
+  geom_vline(xintercept = 0.05, colour="red", linetype = "longdash") + 
+  geom_density() + xlab("Number of pauses: v6")
+
+p_v7_s <- ggplot(v_sl, aes(x=b_v7)) + 
+  geom_vline(xintercept = 0, colour="red", linetype = "longdash") + 
+  geom_density()
+
+p_v8_s <- ggplot(v_sl, aes(x=b_v8)) + 
+  geom_vline(xintercept = 0, colour="red", linetype = "longdash") + 
+  geom_density()
+
+p_v9_s <- ggplot(v_sl, aes(x=b_v9)) + 
+  geom_vline(xintercept = 0, colour="red", linetype = "longdash") + 
+  geom_density()
+
+p_v10_s <- ggplot(v_sl, aes(x=b_v10)) + 
+  geom_vline(xintercept = 0, colour="red", linetype = "longdash") + 
+  geom_density()
+
+grid.arrange(p_v1_s, p_v2_s, p_v3_s, p_v4_s, p_v5_s, p_v6_s, p_v7_s, p_v8_s, p_v9_s, p_v10_s)
+```
+
+
+*Feature importance through tidymodels*
+```{r}
+train_informed_scaled <- train_informed_s[3:13] 
+
+d_inf <- train_informed_scaled %>%
+  mutate(ID = NULL, Trial = NULL, Preds = NULL, Predictions = NULL, v1_s = NULL)
+
+LogisticRegression_inf_SIM <- logistic_reg() %>%
+  set_mode("classification") %>%
+  set_engine("glm") %>%
+  fit(Group ~ . , data = d_inf)
+
+explainer_lm <- explain_tidymodels( 
+  LogisticRegression_inf_SIM,
+  data = train_informed_scaled, 
+  y = as.numeric(train_informed_scaled$Group) - 1,
+  label = "logReg",
+  verbose = FALSE
+)
+
+explainer_lm %>% model_parts() %>% plot(show_boxplots = FALSE) + ggtitle("Feature importance ", "")
+
+
+model_profile_lm1 <- model_profile(explainer_lm, type = "partial",
+                                   variables = c("v1", "v2", "v3", "v4","v5", "v6","v7", "v8","v9", "v10"))
+plot(model_profile_lm1, variables = c("v1", "v2", "v3", "v4","v5", "v6")) + ggtitle("Partial dependence profile ", "")
+plot(model_profile_lm1, variables = c("v7", "v8", "v9", "v10")) + ggtitle("Partial dependence profile ", "")
+
+```
+
+
+
+## Part III - Applying the ML pipeline to empirical data
+
+Download the empirical dataset from brightspace and apply your ML pipeline to the new data, adjusting where needed. Warning: in the simulated dataset we only had 10 features, now you have many more! Such is the life of the ML practitioner. Consider the impact a higher number of features will have on your ML inference, and decide whether you need to cut down the number of features before running the pipeline (or alternatively expand the pipeline to add feature selection).
+
+*Loading data*
+```{r}
+d <- read_csv("Ass3_empiricalData1.csv")
+d$NewID <- as.factor(d$NewID)
+```
+
+
+*Cleaning data and removing highly correlated variables*
+```{r}
+edata <- d %>% 
+  select(-ends_with("Median"),-"Trial", -"Corpus", -"PatID", -"Language", -"Gender", -"NewID") 
+
+
+no_dig_edata <- edata %>% select( -"Diagnosis")
+cor_matrix <- cor(no_dig_edata)
+
+
+cor_matrix_rm <- cor_matrix                  
+cor_matrix_rm[upper.tri(cor_matrix_rm)] <- 0
+diag(cor_matrix_rm) <- 0
+
+new_emp <- no_dig_edata[ , !apply(cor_matrix_rm,
+                           2,
+                           function(x) any(x > 0.7))]
+
+
+emp_data <- cbind(new_emp, Diagnosis = edata$Diagnosis)
+emp_data$Diagnosis <- as.factor(emp_data$Diagnosis)
+```
+
+
+*Dividing data into test and train*
+```{r}
+set.seed(100)
+
+emp_df <- cbind(emp_data, NewID = d$NewID, Gender = d$Gender) 
+
+levels(emp_df$NewID) <- seq(1:221)
+
+emp_df_split <-  partition(emp_df, p = 0.2, id_col = "NewID", cat_col = c("Diagnosis", "Gender")) 
+
+e_test <- emp_df_split[[1]]
+e_train <- emp_df_split[[2]]
+```
+
+
+
+*Scaling the features*
+```{r}
+
+rec_e_train <- e_train %>%
+  recipe(Diagnosis ~ . ) %>%      
+  step_scale(all_numeric() ) %>%
+  step_center(all_numeric() ) %>%
+  prep(training = e_train, retain = TRUE)
+
+e_train_s <- juice(rec_e_train)
+
+e_test_s <- bake(rec_e_train, new_data = e_test, all_predictors()) %>% 
+  mutate(Diagnosis = e_test$Diagnosis)
+```
+
+
+*Global feature importance*
+```{r}
+d_e_train <- e_train_s[2:103] %>% select(-"Gender")
+
+LogisticRegression_inf_emp <- logistic_reg() %>%
+  set_mode("classification") %>%
+  set_engine("glm") %>%
+  fit(Diagnosis ~ . , data = d_e_train)
+
+explainer_lm_emp <- explain_tidymodels(
+  LogisticRegression_inf_emp,
+  data = d_e_train, 
+  y = as.numeric(d_e_train$Diagnosis) - 1,
+  label = "logReg",
+  verbose = FALSE
+)
+
+set.seed(11)
+explainer_lm_emp %>% model_parts() %>% plot(show_boxplots = FALSE) + ggtitle("Feature importance ", "") + scale_x_discrete(guide = guide_axis(check.overlap = TRUE))
+
+
+model_profile_lm_emp <- model_profile(explainer_lm_emp, type = "partial",
+                                   variables = c("MCEP1_Mean", "PercentSilence_Cova", "MCEP8_MAD", "MeanTurnDur_Cova","MCEP4_Mean", "MCEP3_Mean"))
+plot(model_profile_lm_emp, variables = c("MCEP1_Mean", "PercentSilence_Cova", "MCEP8_MAD", "MeanTurnDur_Cova","MCEP4_Mean", "MCEP3_Mean")) + ggtitle("Partial dependence profile ", "")
+
+```
+
+
+
+*Finding accuracy of logistic regression model on empirical data*
+```{r}
+LogisticRegression_inf <- logistic_reg() %>%
+  set_mode("classification") %>%
+  set_engine("glm") %>%
+  fit(Diagnosis ~ . , data = d_e_train)
+
+
+#Train data
+res_train <- e_train_s %>%
+  as_tibble() %>%
+  mutate(
+    log_class_train = predict(LogisticRegression_inf, new_data = e_train_s) %>%
+      pull(.pred_class),
+    log_prob_train = predict(LogisticRegression_inf, new_data = e_train_s, type = "prob") %>%
+      pull(.pred_SCZ),
+  )
+
+metrics(res_train, truth = Diagnosis, estimate = log_class_train) %>%
+  knitr::kable()
+
+
+#Test data
+res_test <- e_test_s %>%
+  as_tibble() %>%
+  mutate(
+    log_class = predict(LogisticRegression_inf, new_data = e_test_s) %>%
+      pull(.pred_class),
+    log_prob = predict(LogisticRegression_inf, new_data = e_test_s, type = "prob") %>%
+      pull(.pred_SCZ) 
+  )
+
+metrics(res_test, truth = Diagnosis, estimate = log_class) %>%
+  knitr::kable()
+```
+
+
+
+
+
+
+
+
+
+
+
+
+

@@ -1,0 +1,396 @@
+---
+title: "Assignment 2 - Meta-analysis of pitch in schizophrenia"
+author: "Lukas Laustsen Aggerholm"
+date: "2022-12-14"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Assignment 2: meta-analysis
+
+## Questions to be answered
+
+1. Simulate data to setup the analysis and gain insight on the structure of the problem. Simulate one dataset of 100 studies (n of participants should follow a normal distribution with mean of 20, sd of 10, but no fewer than 10 participants), with a mean effect size of 0.4, average deviation by study of .4 and measurement error of .8. The data you get should have one row per study, with an effect size mean and standard error. Build a proper bayesian model to analyze the simulated data. Then simulate publication bias (only some of the studies you simulate are likely to be published, which?), the effect of publication bias on your estimates (re-run the model on published studies, assess the difference), and discuss what this implies for your model. remember to use at least one plot to visualize your results. 
+BONUS question: do a power/precision analysis: w this kind of sample sizes (participants) how many studies would you need to acquire good precision (e.g. .1 sd in the pop level estimate)
+
+
+```{r}
+#Loading the packages
+pacman::p_load(tidyverse, dplyr, tidybayes, ggplot2, ggridges, plyr, brms, cmdstanr, gridExtra, readxl)
+```
+
+
+# Question 1
+*Setting parameters for simulation*
+```{r}
+set.seed(578)
+
+EffectMean <- 0.4                                                               
+StudySD <- 0.4                                                                  
+error <- 0.8                                                                    
+
+Studies <- 100                                                                  
+
+d <- tibble(
+  Study = seq(Studies),
+  Participants = round(msm::rtnorm(Studies, 20, 10, lower = 10), 0), 
+  EffectMu = NA, 
+  EffectSigma = NA, 
+  StudyEffect = NA,
+  Published = NA, 
+  PublishedPos = NA
+)
+
+```
+
+*Simulating the data*
+```{r}
+for (i in seq(Studies)) {
+  d$StudyEffect[i] <- rnorm(1, EffectMean, StudySD)
+  sampling <- rnorm(d$Participants[i], d$StudyEffect[i], error)
+  d$EffectMu[i] <- mean(sampling)
+  d$EffectSigma[i] <- sd(sampling)/sqrt(d$Participants[i]) 
+  d$Published[i] <- ifelse(
+    abs(d$EffectMu[i]) - (2*d$EffectSigma[i]) > 0, 
+    rbinom(1, 1, .9), rbinom(1, 1, .1)) 
+  d$PublishedPos[i] <- ifelse(
+    abs(d$EffectMu[i]) - (2*d$EffectSigma[i]) > 0 & d$EffectMu[i] > 0,  
+    rbinom(1, 1, .9), rbinom(1, 1, .1))  
+}
+
+pub_bias_all <- ggplot(d) +
+aes(x = EffectMu) +
+geom_histogram(bins = 30L, fill = "#E68613", color = "#E68613", alpha = 0.3) +
+labs(title = "Pub bias: all studies") + 
+geom_vline(xintercept = 0, color="black") +
+theme_minimal() +
+theme(plot.title = element_text(size = 18L, face = "bold"))
+
+pub_bias_1 <- ggplot(subset(d, Published == 1)) +
+aes(x = EffectMu) +
+geom_histogram(bins = 30L, fill = "#E68613", color = "#E68613", alpha = 0.3) +
+labs(title = "Pub bias: Published = 1") + 
+geom_vline(xintercept = 0, color="black") +
+theme_minimal() +
+theme(plot.title = element_text(size = 18L, face = "bold"))
+
+pub_bias_pubpos_1 <- ggplot(subset(d, PublishedPos == 1)) +
+aes(x = EffectMu) +
+geom_histogram(bins = 30L, fill = "#E68613", color = "#E68613", alpha = 0.3) +
+labs(title = "Pub bias: PublishedPos = 1") + 
+geom_vline(xintercept = 0, color="black") +
+theme_minimal() +
+theme(plot.title = element_text(size = 18L, face = "bold"))
+
+grid.arrange(pub_bias_all, pub_bias_1, pub_bias_pubpos_1)
+```
+
+
+*Meta-analytic multilevel modeling*
+```{r}
+f1 <- bf(EffectMu | se(EffectSigma) ~ 1 + (1 | Study))
+get_prior(f1, d, gaussian)
+```
+
+
+*Setting priors*
+```{r}
+model_1_p <- c(
+  prior(normal(0, 0.3), class = Intercept), 
+  prior(normal(0, 0.3), class = sd) 
+)
+```
+
+
+*Prior predictive checks*
+```{r}
+set.seed(70)
+model_1_prior <- brm( 
+  f1, 
+  data = d, 
+  family = gaussian,
+  prior = model_1_p, 
+  sample_prior = "only", 
+  backend = "cmdstanr",
+  threads = threading(2), 
+  chains = 2, 
+  core = 2, 
+  control = list(adapt_delt = 0.99, max_treedepth = 20))
+m1_prior <- pp_check(model_1_prior, ndraws=100) + labs(title = "Prior predictive check")
+
+model_1_prior_pub <- update(model_1_prior, newdata = subset(d, Published == 1))
+model_1_prior_pubpos <- update(model_1_prior, newdata = subset(d, PublishedPos == 1))
+
+m2_prior <- pp_check(model_1_prior_pub, ndraws = 100) + labs(title = "Prior predictive check, Published = 1") 
+m3_prior <- pp_check(model_1_prior_pubpos, ndraws = 100) + labs(title = "Prior predictive check, PublishedPos = 1")
+
+grid.arrange(m1_prior, m2_prior, m3_prior)
+```
+
+
+*Posterior predictive checks*
+```{r}
+set.seed(1)
+model_1_post <- brm( 
+  f1, 
+  data = d, 
+  family = gaussian,
+  prior = model_1_p, 
+  sample_prior = T, 
+  backend = "cmdstanr",
+  threads = threading(2), 
+  chains = 2, 
+  core = 2, 
+  control = list(adapt_delt = 0.99, max_treedepth = 20))
+
+m1 <- pp_check(model_1_post, ndraws=100) + labs(title = "Posterior predictive check")
+model_1_post_pub <- update(model_1_post, newdata = subset(d, Published == 1))
+model_1_post_pubpos <- update(model_1_post, newdata = subset(d, PublishedPos == 1))
+
+m2 <- pp_check(model_1_post_pub, ndraws = 100) + labs(title = "Posterior predictive check, Published = 1") 
+m3 <- pp_check(model_1_post_pubpos, ndraws = 100) + labs(title = "Posterior predictive check, PublishedPos = 1")
+
+grid.arrange(m1, m2, m3)
+
+```
+*Effect size estimates*
+```{r}
+summary(model_1_post)
+summary(model_1_post_pub)
+summary(model_1_post_pubpos)
+```
+
+
+*Comparing the estimates for each model*
+```{r}
+posterior_2 <- as_draws_df(model_1_post)
+#variables(posterior_2)
+model_1_post_pub_draws <- as_draws_df(model_1_post_pub)
+
+model_1_post_pubpos_draws <- as_draws_df(model_1_post_pubpos)
+
+mod_1_df <- tibble(
+  Model = "1",
+  mean_est = mean(posterior_2$b_Intercept),
+  upper = quantile(posterior_2$b_Intercept, 0.975), 
+  lower = quantile(posterior_2$b_Intercept, 0.025)
+)
+
+mod_2_df <- tibble(
+  Model = "2",
+  mean_est = mean(model_1_post_pub_draws$b_Intercept),
+  upper = quantile(model_1_post_pub_draws$b_Intercept, 0.975), 
+  lower = quantile(model_1_post_pub_draws$b_Intercept, 0.025)
+)
+
+mod_3_df <- tibble(
+  Model = "3",
+  mean_est = mean(model_1_post_pubpos_draws$b_Intercept),
+  upper = quantile(model_1_post_pubpos_draws$b_Intercept, 0.975), 
+  lower = quantile(model_1_post_pubpos_draws$b_Intercept, 0.025)
+)
+
+df_models_draws <- rbind(mod_1_df, mod_2_df, mod_3_df)
+
+
+plots_est_p2 <- ggplot(df_models_draws) +
+  geom_pointrange(aes(x= Model,y= mean_est,
+                      ymin=lower,ymax=upper,
+                      color = Model),alpha= 1) +
+  xlab("Model") +
+  ylab("Estimate")
+plots_est_p2
+
+```
+*Prior-posterior update checks*
+```{r}
+plot1 <- ggplot(posterior_2) +
+  geom_histogram(aes(prior_sd_Study), fill="black", color="black",alpha=0.6,) +
+  geom_histogram(aes(sd_Study__Intercept), fill="#E68613", color="#E68613",alpha=0.6) + 
+  theme_classic() +
+   xlab("Prior-posterior update check on standard deviation(all)")
+
+plot2 <- ggplot(posterior_2) +
+  geom_histogram(aes(prior_Intercept), fill="black", color="black",alpha=0.6,) +
+  geom_histogram(aes(b_Intercept), fill="#E68613", color="#E68613",alpha=0.6) + 
+  theme_classic() +
+   xlab("Prior-posterior update check on intercept(all)")
+grid.arrange(plot1, plot2)
+
+plot3 <- ggplot(model_1_post_pub_draws) +
+  geom_histogram(aes(prior_sd_Study), fill="black", color="black",alpha=0.6,) +
+  geom_histogram(aes(sd_Study__Intercept), fill="#E68613", color="#E68613",alpha=0.6) + 
+  theme_classic() +
+   xlab("Prior-posterior update check on standard deviation(pub)")
+
+plot4 <- ggplot(model_1_post_pub_draws) +
+  geom_histogram(aes(prior_Intercept), fill="black", color="black",alpha=0.6,) +
+  geom_histogram(aes(b_Intercept), fill="#E68613", color="#E68613",alpha=0.6) + 
+  theme_classic() +
+   xlab("Prior-posterior update check on intercept(pub)")
+grid.arrange(plot3, plot4)
+
+plot5 <- ggplot(model_1_post_pubpos_draws) +
+  geom_histogram(aes(prior_sd_Study), fill="black", color="black",alpha=0.6,) +
+  geom_histogram(aes(sd_Study__Intercept), fill="#E68613", color="#E68613",alpha=0.6) + 
+  theme_classic() +
+   xlab("Prior-posterior update check on standard deviation(pubpos)")
+
+plot6 <- ggplot(model_1_post_pubpos_draws) +
+  geom_histogram(aes(prior_Intercept), fill="black", color="black",alpha=0.6,) +
+  geom_histogram(aes(b_Intercept), fill="#E68613", color="#E68613",alpha=0.6) + 
+  theme_classic() +
+   xlab("Prior-posterior update check on intercept(pubpos)")
+grid.arrange(plot5, plot6)
+
+```
+
+
+
+## Question 2
+2. What is the current evidence for distinctive vocal patterns in schizophrenia? 
+Use the data from Parola et al (2020) - https://www.dropbox.com/s/0l9ur0gaabr80a8/Matrix_MetaAnalysis_Diagnosis_updated290719.xlsx?dl=0 - focusing on pitch variability (PITCH_F0SD).  Describe the data available (studies, participants). Using the model from question 1 analyze the data, visualize and report the findings: population level effect size; how well studies reflect it; influential studies, publication bias.
+
+```{r}
+#Loading the data in:
+ass_2_d <- read_excel("Matrix_MetaAnalysis_Diagnosis_updated290719.xlsx")
+```
+
+
+
+*Describing the data*
+```{r}
+ass_2_d$StudyID <- as.factor(ass_2_d$StudyID)
+length(levels(ass_2_d$StudyID)) 
+
+ass_2_d$MALE_SZ <- as.numeric(ass_2_d$MALE_SZ)
+ass_2_d$FEMALE_SZ <- as.numeric(ass_2_d$FEMALE_SZ)
+
+ass_2_d$MALE_HC <- as.numeric(ass_2_d$MALE_HC)
+ass_2_d$FEMALE_HC <- as.numeric(ass_2_d$FEMALE_HC)
+
+ass_2_d$AGE_M_SZ <- as.numeric(ass_2_d$AGE_M_SZ)
+ass_2_d$AGE_M_HC <- as.numeric(ass_2_d$AGE_M_HC)
+
+#summary(ass_2_d)
+```
+
+
+*Putting variables we want to investigate on same scale through Cohen's D*
+```{r}
+library(metafor)
+
+Outcome_ES <- escalc('SMD',
+  n1i = SAMPLE_SIZE_SZ, n2i = SAMPLE_SIZE_HC,
+  m1i = PITCH_F0SD_SZ_M, m2i=PITCH_F0SD_HC_M,
+  sd1i = PITCH_F0SD_SZ_SD, sd2i=PITCH_F0SD_HC_SD,
+  data = ass_2_d)
+```
+
+Yi - The EffectMu
+Vi - Standard error
+
+*Effect-size means for studies with available data*
+```{r}
+study_effect_emp <- ggplot(Outcome_ES) +
+aes(x = yi) +
+geom_histogram(bins = 30L, fill = "#E68613", color = "#E68613", alpha = 0.3) +
+labs(title = "Effect-size mean of empirical data") + 
+geom_vline(xintercept = 0, color="black") +
+theme_minimal() +
+theme(plot.title = element_text(size = 18L, face = "bold")) +
+  xlab("Effect-size mean")
+study_effect_emp
+```
+
+
+*Defining our model*
+```{r}
+pitch_data_f <- bf(yi | se(vi) ~ 1 + (1 | StudyID))
+get_prior(pitch_data_f, data = Outcome_ES, gaussian)
+
+model_2_priors <- c(
+  prior(normal(0, 0.3), class = Intercept),
+  prior(normal(0, 0.3), class = sd)
+)
+
+```
+
+*Prior- and posterior predictive checks*
+```{r}
+set.seed(29)
+model_p2_prior <- brm( 
+  pitch_data_f, 
+  data = Outcome_ES, 
+  family = gaussian,
+  prior = model_2_priors, 
+  sample_prior = "only", 
+  backend = "cmdstanr",
+  threads = threading(2), 
+  chains = 2, 
+  core = 2, 
+  control = list(adapt_delt = 0.99, max_treedepth = 20))
+update(model_p2_prior)
+PP <- pp_check(model_p2_prior, ndraws=100) + labs(title = "Prior-predictive check, empirical data")
+
+set.seed(63)
+model_p2_post <- brm( 
+  pitch_data_f, 
+  data = Outcome_ES, 
+  family = gaussian,
+  prior = model_2_priors, 
+  sample_prior = T, 
+  backend = "cmdstanr",
+  threads = threading(2), 
+  chains = 2, 
+  core = 2, 
+  control = list(adapt_delt = 0.99, max_treedepth = 20))
+update(model_p2_post)
+PP1 <- pp_check(model_p2_post, ndraws=100) + labs(title = "Posterior-predictive check, empirical data")
+grid.arrange(PP, PP1)
+```
+
+
+
+*Prior-posterior update checks*
+```{r}
+model_p2_draws <- as_draws_df(model_p2_post)
+variables(model_p2_draws)
+
+plot1_emp <- ggplot(model_p2_draws) +
+  geom_histogram(aes(prior_sd_StudyID), fill="black", color="black",alpha=0.6,) +
+  geom_histogram(aes(sd_StudyID__Intercept), fill="#E68613", color="#E68613",alpha=0.6) + 
+  theme_classic() +
+   xlab("Prior-posterior update check on standard deviation")
+
+plot2_emp <- ggplot(model_p2_draws) +
+  geom_histogram(aes(prior_Intercept), fill="black", color="black",alpha=0.6,) +
+  geom_histogram(aes(b_Intercept), fill="#E68613", color="#E68613",alpha=0.6) + 
+  theme_classic() +
+   xlab("Prior-posterior update check on intercept")
+
+grid.arrange(plot1_emp, plot2_emp)
+
+```
+
+
+
+```{r}
+summary(model_p2_post)
+```
+
+*Individual differences/Influential studies*
+```{r}
+ggplot(Outcome_ES)+
+  geom_point(aes(x=StudyID, y=yi))+
+  geom_abline(aes(slope=0, intercept=-0.11))+
+  ylab("Effect-size mean")
+```
+
+
+
+
+
